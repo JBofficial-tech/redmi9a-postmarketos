@@ -1,32 +1,26 @@
-name: Redmi 9A Kernel DTB Build
+name: Redmi 9A - Device Tree Investigation
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  inspect-dandelion:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            git \
             bc \
             bison \
+            flex \
             build-essential \
             clang \
-            flex \
-            git \
-            libelf-dev \
-            libssl-dev \
             lld \
             llvm \
-            cpio \
-            rsync
+            device-tree-compiler
 
       - name: Clone kernel source
         run: |
@@ -36,60 +30,97 @@ jobs:
             https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
             kernel
 
-      - name: Inspect device tree
+      - name: Inspect kernel device trees
         working-directory: kernel
         run: |
-          echo "=== DTS files ==="
-          find arch/arm64/boot/dts -type f | sort | grep -Ei \
-            'dandelion|garden|mt6762|mt6765' || true
+          echo "======================================"
+          echo "Searching for Redmi 9A / dandelion"
+          echo "======================================"
 
-          echo "=== ARM64 configs ==="
-          find arch/arm64/configs -maxdepth 1 -type f | sort | grep -Ei \
-            'dandelion|garden|mt6762|mt6765' || true
-
-      - name: Build kernel
-        working-directory: kernel
-        run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-
-          make O=out ARCH=arm64 defconfig
-
-          make -j"$(nproc)" \
-            O=out \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            Image \
-            dtbs
-
-      - name: Collect build output
-        run: |
-          mkdir -p artifacts
-
-          if [ -f kernel/out/arch/arm64/boot/Image ]; then
-            cp kernel/out/arch/arm64/boot/Image artifacts/
-          fi
-
-          if [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
-            cp kernel/out/arch/arm64/boot/Image.gz artifacts/
-          fi
-
-          if [ -f kernel/out/.config ]; then
-            cp kernel/out/.config artifacts/kernel.config
-          fi
-
-          find kernel/out/arch/arm64/boot/dts \
+          find arch/arm64/boot/dts \
             -type f \
-            \( -name "*.dtb" -o -name "*.dtbo" \) \
-            -print \
-            -exec cp --parents {} artifacts/ \; || true
+            \( -name "*.dts" -o -name "*.dtsi" \) \
+            -print | \
+            grep -Ei \
+            'dandelion|dandelion64|redmi.?9a|xiaomi' || true
 
-          echo "=== FINAL ARTIFACTS ==="
-          find artifacts -type f -print
+          echo
+          echo "======================================"
+          echo "Searching for Redmi / Xiaomi references"
+          echo "======================================"
 
-      - name: Upload artifacts
+          grep -RniE \
+            'dandelion|redmi 9a|redmi9a|xiaomi,dandelion|xiaomi.*9a' \
+            arch/arm64/boot/dts 2>/dev/null | \
+            head -200 || true
+
+          echo
+          echo "======================================"
+          echo "MT6762 / MT6765 DTS files"
+          echo "======================================"
+
+          find arch/arm64/boot/dts \
+            -type f \
+            \( -name "*.dts" -o -name "*.dtsi" \) | \
+            grep -Ei 'mt6762|mt6765' | \
+            sort || true
+
+      - name: Search device-tree Makefiles
+        working-directory: kernel
+        run: |
+          echo "======================================"
+          echo "Relevant Makefile entries"
+          echo "======================================"
+
+          grep -RniE \
+            'dandelion|angelican|mt6762|mt6765' \
+            arch/arm64/boot/dts/Makefile \
+            arch/arm64/boot/dts/mediatek/Makefile \
+            2>/dev/null || true
+
+      - name: Search compatible strings
+        working-directory: kernel
+        run: |
+          echo "======================================"
+          echo "Relevant compatible strings"
+          echo "======================================"
+
+          grep -RniE \
+            'mediatek,mt6762|mediatek,mt6765|xiaomi' \
+            arch/arm64/boot/dts/mediatek \
+            2>/dev/null | \
+            head -250 || true
+
+      - name: Save investigation report
+        working-directory: kernel
+        run: |
+          mkdir -p ../report
+
+          {
+            echo "Redmi 9A Device Tree Investigation"
+            echo
+            echo "Kernel commit:"
+            git log -1 --oneline
+            echo
+
+            echo "Possible dandelion/Xiaomi DTS files:"
+            find arch/arm64/boot/dts \
+              -type f \
+              \( -name "*.dts" -o -name "*.dtsi" \) | \
+              grep -Ei \
+              'dandelion|dandelion64|redmi.?9a|xiaomi' || true
+
+            echo
+            echo "MT6762/MT6765 DTS files:"
+            find arch/arm64/boot/dts \
+              -type f \
+              \( -name "*.dts" -o -name "*.dtsi" \) | \
+              grep -Ei 'mt6762|mt6765' | \
+              sort || true
+          } > ../report/device-tree-report.txt
+
+      - name: Upload investigation report
         uses: actions/upload-artifact@v4
         with:
-          name: redmi9a-kernel-dtb
-          path: artifacts
+          name: redmi9a-device-tree-report
+          path: report/device-tree-report.txt
