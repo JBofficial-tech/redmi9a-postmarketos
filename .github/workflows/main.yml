@@ -1,4 +1,53 @@
-      - name: Build kernel and DTBs
+name: Redmi 9A Kernel DTB Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            clang \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            cpio \
+            rsync
+
+      - name: Clone kernel source
+        run: |
+          git clone \
+            --depth=1 \
+            --branch mt6765 \
+            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
+            kernel
+
+      - name: Inspect device tree
+        working-directory: kernel
+        run: |
+          echo "=== DTS files ==="
+          find arch/arm64/boot/dts -type f | sort | grep -Ei \
+            'dandelion|garden|mt6762|mt6765' || true
+
+          echo "=== ARM64 configs ==="
+          find arch/arm64/configs -maxdepth 1 -type f | sort | grep -Ei \
+            'dandelion|garden|mt6762|mt6765' || true
+
+      - name: Build kernel
         working-directory: kernel
         run: |
           export ARCH=arm64
@@ -14,27 +63,33 @@
             Image \
             dtbs
 
-      - name: Collect kernel and DTBs
+      - name: Collect build output
         run: |
           mkdir -p artifacts
 
-          cp kernel/out/arch/arm64/boot/Image artifacts/Image 2>/dev/null || true
-          cp kernel/out/arch/arm64/boot/Image.gz artifacts/Image.gz 2>/dev/null || true
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image artifacts/
+          fi
+
+          if [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+            cp kernel/out/arch/arm64/boot/Image.gz artifacts/
+          fi
+
+          if [ -f kernel/out/.config ]; then
+            cp kernel/out/.config artifacts/kernel.config
+          fi
 
           find kernel/out/arch/arm64/boot/dts \
-            -type f \( -name "*.dtb" -o -name "*.dtbo" \) \
-            -exec cp --parents {} artifacts/ \; 2>/dev/null || true
+            -type f \
+            \( -name "*.dtb" -o -name "*.dtbo" \) \
+            -print \
+            -exec cp --parents {} artifacts/ \; || true
 
-          cp kernel/out/.config artifacts/kernel.config 2>/dev/null || true
+          echo "=== FINAL ARTIFACTS ==="
+          find artifacts -type f -print
 
-          echo "=== Kernel ==="
-          ls -lh artifacts/Image* 2>/dev/null || true
-
-          echo "=== DTB/DTBO ==="
-          find artifacts -type f \( -name "*.dtb" -o -name "*.dtbo" \) -print
-
-      - name: Upload kernel artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: redmi9a-kernel-dtb-test
-          path: artifacts/
+          name: redmi9a-kernel-dtb
+          path: artifacts
