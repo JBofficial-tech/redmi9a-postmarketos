@@ -1,0 +1,94 @@
+name: Redmi 9A Linux Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            clang \
+            lld \
+            llvm \
+            libssl-dev \
+            libelf-dev \
+            libdw-dev \
+            cpio \
+            gzip \
+            zip \
+            rsync \
+            wget
+
+      - name: Clone Redmi 9A Linux kernel
+        run: |
+          git clone --depth=1 \
+            --branch mt6765 \
+            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
+            kernel
+
+      - name: Show kernel information
+        working-directory: kernel
+        run: |
+          echo "Kernel commit:"
+          git log -1 --oneline
+          echo
+          echo "Available Redmi/MT6765 configs:"
+          find arch/arm64/configs -maxdepth 1 -type f | grep -Ei 'mt6765|dandelion|garden|defconfig' | head -50 || true
+
+      - name: Find suitable defconfig
+        working-directory: kernel
+        run: |
+          echo "Searching for configuration files..."
+          find arch/arm64/configs -type f | sort | head -100
+
+      - name: Build test
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          make O=out ARCH=arm64 defconfig
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Collect kernel
+        run: |
+          mkdir -p artifacts
+
+          if [ -f kernel/out/arch/arm64/boot/Image ]; then
+            cp kernel/out/arch/arm64/boot/Image artifacts/Image
+          fi
+
+          if [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+            cp kernel/out/arch/arm64/boot/Image.gz artifacts/Image.gz
+          fi
+
+          cp kernel/out/.config artifacts/kernel.config 2>/dev/null || true
+
+          ls -lah artifacts
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: redmi9a-kernel-test
+          path: artifacts/
