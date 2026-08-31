@@ -1,116 +1,77 @@
-name: Redmi 9A - Dandelion DTB Build
+name: Redmi 9A - Stock Boot Inspector
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-dandelion-dtb:
+  inspect:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Install dependencies
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            clang \
-            device-tree-compiler \
-            flex \
-            git \
-            libelf-dev \
-            libssl-dev \
-            lld \
-            llvm
+            wget \
+            curl \
+            python3 \
+            unzip \
+            tar \
+            gzip \
+            file \
+            binwalk \
+            xz-utils
 
-      - name: Clone kernel source
+      - name: Download Redmi 9A Global Fastboot ROM
         run: |
-          git clone \
-            --depth=1 \
-            --branch mt6765 \
-            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
-            kernel
+          wget -O rom.tgz \
+            "https://bigota.d.miui.com/V12.5.7.0.RCDMIXM/dandelion_global_images_V12.5.7.0.RCDMIXM_20221107.0000.00_11.0_global_3319fae180.tgz"
 
-      - name: Verify Redmi 9A DTS
-        working-directory: kernel
+      - name: Check ROM
         run: |
-          test -f arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dts
+          ls -lh rom.tgz
+          file rom.tgz
 
-          echo "Redmi 9A DTS found:"
-          echo "arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dts"
+      - name: Extract ROM
+        run: |
+          mkdir rom
+          tar -xzf rom.tgz -C rom
+
+      - name: Find boot image
+        run: |
+          echo "Searching boot.img..."
+          find rom -type f -name "boot.img" -print
+
+      - name: Inspect boot image
+        run: |
+          BOOT=$(find rom -type f -name "boot.img" | head -1)
+
+          if [ -z "$BOOT" ]; then
+            echo "ERROR: boot.img not found"
+            exit 1
+          fi
+
+          mkdir -p inspection
+
+          cp "$BOOT" inspection/stock-boot.img
+
+          echo "=== FILE ==="
+          file "$BOOT" | tee inspection/file.txt
 
           echo
-          echo "DTS references:"
-          grep -nE 'compatible|model|include' \
-            arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dts \
-            | head -100
-
-      - name: Configure kernel
-        working-directory: kernel
-        run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-
-          make O=out ARCH=arm64 defconfig
-
-      - name: Build Redmi 9A DTB
-        working-directory: kernel
-        run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-
-          make -j"$(nproc)" \
-            O=out \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            dtbs
-
-          test -f \
-            out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
-
-      - name: Validate Redmi 9A DTB
-        working-directory: kernel
-        run: |
-          DTB="out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb"
-
-          echo "DTB:"
-          ls -lh "$DTB"
+          echo "=== SIZE ==="
+          stat -c '%n %s bytes' "$BOOT" | tee inspection/size.txt
 
           echo
-          echo "DTB header:"
-          file "$DTB"
+          echo "=== STRINGS / HEADER INFO ==="
+          strings "$BOOT" | head -100 | tee inspection/strings.txt
 
           echo
-          echo "DTB compatible strings:"
-          dtc -I dtb -O dts "$DTB" 2>/dev/null \
-            | grep -E 'compatible|model' \
-            | head -30 || true
+          echo "=== BINWALK ==="
+          binwalk "$BOOT" | tee inspection/binwalk.txt
 
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifacts
-
-          cp \
-            kernel/out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb \
-            artifacts/dandelion.dtb
-
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            artifacts/Image \
-            2>/dev/null || true
-
-          cp \
-            kernel/out/.config \
-            artifacts/kernel.config \
-            2>/dev/null || true
-
-          echo "=== FINAL OUTPUT ==="
-          ls -lah artifacts
-
-      - name: Upload Redmi 9A artifacts
+      - name: Upload stock boot
         uses: actions/upload-artifact@v4
         with:
-          name: redmi9a-dandelion-dtb
-          path: artifacts/
+          name: redmi9a-stock-boot-inspection
+          path: inspection/
