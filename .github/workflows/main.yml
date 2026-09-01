@@ -6,15 +6,15 @@ on:
 jobs:
   inspect-stock-boot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            curl \
             wget \
+            curl \
             file \
             binwalk \
             xz-utils \
@@ -23,52 +23,55 @@ jobs:
             unzip \
             python3
 
-      - name: Download Redmi 9A India Fastboot ROM
+      - name: Download official Xiaomi ROM
         run: |
           mkdir -p work
 
-          URL="https://direct.androidfilehost.com/?fid=4279422670115735498"
+          URL="https://bigota.d.miui.com/V12.5.9.0.RCDINXM/dandelion_in_global_images_V12.5.9.0.RCDINXM_20220915.0000.00_11.0_in_921f22da4d.tgz"
 
-          echo "Downloading Redmi 9A V12.5.9.0.RCDINXM..."
-          curl -L \
-            --fail \
-            --retry 5 \
-            --retry-delay 10 \
-            --connect-timeout 30 \
-            -o work/rom.tgz \
+          echo "Downloading official Xiaomi ROM..."
+          echo "$URL"
+
+          wget \
+            --progress=dot:giga \
+            --show-progress \
+            --tries=5 \
+            --timeout=60 \
+            -O work/rom.tgz \
             "$URL"
 
-          echo "=== Downloaded file ==="
+          echo
+          echo "=== FILE ==="
           ls -lh work/rom.tgz
           file work/rom.tgz
 
-      - name: Verify ROM MD5
+      - name: Verify MD5
         run: |
           EXPECTED="921f22da4d242430f4ae54999da07b23"
-
           ACTUAL=$(md5sum work/rom.tgz | awk '{print $1}')
 
-          echo "Expected MD5: $EXPECTED"
-          echo "Actual MD5:   $ACTUAL"
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
 
           if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: MD5 mismatch!"
+            echo "ERROR: MD5 mismatch."
+            echo "The downloaded file is not the expected ROM."
             exit 1
           fi
 
-          echo "MD5 verification successful."
+          echo "MD5 verification PASSED."
 
-      - name: Extract Fastboot ROM
+      - name: Extract ROM
         run: |
           mkdir -p work/rom
 
           tar -xzf work/rom.tgz \
             -C work/rom
 
-          echo "=== ROM extracted ==="
-          find work/rom -maxdepth 3 -type f | head -100
+          echo "=== ROM CONTENT ==="
+          find work/rom -maxdepth 3 -type f | head -150
 
-      - name: Locate stock boot image
+      - name: Find stock boot.img
         run: |
           BOOT=$(find work/rom \
             -type f \
@@ -76,44 +79,34 @@ jobs:
             | head -1)
 
           if [ -z "$BOOT" ]; then
-            echo "ERROR: boot.img not found!"
+            echo "ERROR: boot.img not found."
             exit 1
           fi
 
-          echo "Stock boot found:"
+          echo "Found stock boot:"
           echo "$BOOT"
 
           mkdir -p inspection
-
           cp "$BOOT" inspection/stock-boot.img
 
       - name: Inspect boot image
         run: |
           BOOT="inspection/stock-boot.img"
 
-          echo "================================"
-          echo "FILE INFORMATION"
-          echo "================================"
-
+          echo "=== FILE TYPE ==="
           file "$BOOT" | tee inspection/file.txt
 
           echo
-          echo "================================"
-          echo "BOOT IMAGE SIZE"
-          echo "================================"
-
+          echo "=== SIZE ==="
           stat -c '%n: %s bytes' "$BOOT" \
             | tee inspection/size.txt
 
           echo
-          echo "================================"
-          echo "BINWALK"
-          echo "================================"
-
+          echo "=== BINWALK ==="
           binwalk "$BOOT" \
             | tee inspection/binwalk.txt
 
-      - name: Detect Android boot signatures
+      - name: Detect boot signatures
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -122,6 +115,7 @@ jobs:
           data = p.read_bytes()
 
           print("Boot image size:", len(data), "bytes")
+          print()
 
           signatures = [
               b"ANDROID!",
@@ -129,9 +123,6 @@ jobs:
               b"AVB0",
               b"SEANDROIDENFORCE",
           ]
-
-          print()
-          print("Known signatures:")
 
           for sig in signatures:
               pos = data.find(sig)
@@ -149,7 +140,7 @@ jobs:
                   )
           PY
 
-      - name: Extract useful strings
+      - name: Extract strings
         run: |
           strings inspection/stock-boot.img \
             | head -300 \
@@ -158,25 +149,26 @@ jobs:
       - name: Create summary
         run: |
           {
+            echo "================================="
             echo "Redmi 9A Stock Boot Inspection"
+            echo "================================="
             echo
-            echo "Firmware:"
-            echo "V12.5.9.0.RCDINXM"
-            echo
-            echo "Device:"
-            echo "Redmi 9A / dandelion"
-            echo
-            echo "Android:"
-            echo "11"
+            echo "Device: Redmi 9A"
+            echo "Codename: dandelion"
+            echo "Region: India"
+            echo "MIUI: V12.5.9.0.RCDINXM"
+            echo "Android: 11"
             echo
             echo "Expected ROM MD5:"
             echo "921f22da4d242430f4ae54999da07b23"
             echo
-            echo "Files:"
+            echo "Inspection files:"
             ls -lh inspection/
           } > inspection/SUMMARY.txt
 
-      - name: Upload inspection artifact
+          cat inspection/SUMMARY.txt
+
+      - name: Upload inspection
         uses: actions/upload-artifact@v4
         with:
           name: redmi9a-stock-boot-inspection
