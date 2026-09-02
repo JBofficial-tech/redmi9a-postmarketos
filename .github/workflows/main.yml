@@ -1,13 +1,3 @@
-name: Deep Inspect Redmi 9A Stock Boot
-
-on:
-  workflow_dispatch:
-
-jobs:
-  inspect:
-    runs-on: ubuntu-latest
-
-    steps:
       - name: Download stock boot artifact
         env:
           GH_TOKEN: ${{ github.token }}
@@ -37,18 +27,15 @@ jobs:
             "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
             > work/artifact.zip
 
+          echo "Extracting artifact..."
           unzip -o work/artifact.zip -d work/
 
-          BOOT=$(find work -name "stock-boot.img" -type f | head -n 1)
-
-          if [ -z "$BOOT" ]; then
-            echo "ERROR: stock-boot.img not found"
+          if [ ! -f "work/stock-boot.img" ]; then
+            echo "ERROR: stock-boot.img not found!"
             exit 1
           fi
 
-          cp "$BOOT" work/stock-boot.img
-
-          echo "Stock boot:"
+          echo "Stock boot successfully extracted:"
           ls -lh work/stock-boot.img
 
       - name: Install analysis tools
