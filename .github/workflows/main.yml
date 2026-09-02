@@ -1,4 +1,4 @@
-name: Inspect Redmi 9A Stock Boot
+name: Deep Inspect Redmi 9A Stock Boot
 
 on:
   workflow_dispatch:
@@ -14,9 +14,11 @@ jobs:
           RUN_ID: "33605127291"
           ARTIFACT_NAME: "Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM"
         run: |
+          set -e
+
           mkdir -p work
 
-          echo "Finding artifact..."
+          echo "Finding stock boot artifact..."
 
           ARTIFACT_ID=$(gh api \
             "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
@@ -24,7 +26,7 @@ jobs:
             | head -n 1)
 
           if [ -z "$ARTIFACT_ID" ]; then
-            echo "ERROR: Artifact not found!"
+            echo "ERROR: Artifact not found"
             exit 1
           fi
 
@@ -33,134 +35,264 @@ jobs:
           gh api \
             -H "Accept: application/vnd.github+json" \
             "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            > work/stock-artifact.zip
+            > work/artifact.zip
 
-          echo "Artifact downloaded:"
-          ls -lh work/stock-artifact.zip
+          unzip -o work/artifact.zip -d work/
 
-      - name: Extract boot.img
-        run: |
-          mkdir -p work/boot
-
-          unzip -o work/stock-artifact.zip -d work/boot
-
-          echo "Contents:"
-          find work/boot -type f -exec ls -lh {} \;
-
-          BOOT=$(find work/boot -name "stock-boot.img" -type f | head -n 1)
+          BOOT=$(find work -name "stock-boot.img" -type f | head -n 1)
 
           if [ -z "$BOOT" ]; then
-            echo "ERROR: stock-boot.img not found!"
+            echo "ERROR: stock-boot.img not found"
             exit 1
           fi
 
           cp "$BOOT" work/stock-boot.img
 
-          echo "Stock boot image:"
+          echo "Stock boot:"
           ls -lh work/stock-boot.img
 
-      - name: Verify stock boot
+      - name: Install analysis tools
         run: |
-          echo "========== FILE =========="
+          sudo apt-get update
+          sudo apt-get install -y \
+            binwalk \
+            android-sdk-libsparse-utils \
+            cpio \
+            gzip \
+            xz-utils \
+            lz4 \
+            zstd \
+            file
+
+      - name: Basic image information
+        run: |
+          echo "======================================"
+          echo " BASIC IMAGE INFORMATION"
+          echo "======================================"
+
           file work/stock-boot.img
 
           echo
-          echo "========== SIZE =========="
-          stat -c "Size: %s bytes" work/stock-boot.img
+          stat work/stock-boot.img
 
           echo
-          echo "========== SHA256 =========="
+          echo "SHA256:"
           sha256sum work/stock-boot.img
 
           echo
-          echo "========== MD5 =========="
+          echo "MD5:"
           md5sum work/stock-boot.img
 
           echo
-          echo "========== BOOT MAGIC =========="
-          xxd -l 16 work/stock-boot.img
+          echo "First 256 bytes:"
+          xxd -l 256 work/stock-boot.img
 
       - name: Parse Android boot header
         run: |
           python3 <<'PY'
           import struct
 
-          path = "work/stock-boot.img"
+          p = "work/stock-boot.img"
 
-          with open(path, "rb") as f:
+          with open(p, "rb") as f:
               data = f.read(4096)
 
-          print("========== ANDROID BOOT HEADER ==========")
+          print("======================================")
+          print(" ANDROID BOOT HEADER")
+          print("======================================")
 
-          magic = data[0:8]
-          print("Magic:", magic)
+          print("Magic:", data[0:8])
 
-          if magic != b"ANDROID!":
-              print("ERROR: Not a standard Android boot image!")
-              raise SystemExit(1)
+          if data[0:8] != b"ANDROID!":
+              raise SystemExit("Not an Android boot image")
 
-          kernel_size = struct.unpack_from("<I", data, 8)[0]
-          kernel_addr = struct.unpack_from("<I", data, 12)[0]
+          def u32(off):
+              return struct.unpack_from("<I", data, off)[0]
 
-          ramdisk_size = struct.unpack_from("<I", data, 16)[0]
-          ramdisk_addr = struct.unpack_from("<I", data, 20)[0]
+          print("Kernel size :", u32(8))
+          print("Kernel addr :", hex(u32(12)))
 
-          second_size = struct.unpack_from("<I", data, 24)[0]
-          second_addr = struct.unpack_from("<I", data, 28)[0]
+          print("Ramdisk size:", u32(16))
+          print("Ramdisk addr:", hex(u32(20)))
 
-          tags_addr = struct.unpack_from("<I", data, 32)[0]
-          page_size = struct.unpack_from("<I", data, 36)[0]
+          print("Second size :", u32(24))
+          print("Second addr :", hex(u32(28)))
 
-          dt_size = struct.unpack_from("<I", data, 40)[0]
-          dt_addr = struct.unpack_from("<I", data, 44)[0]
+          print("Tags addr   :", hex(u32(32)))
+          print("Page size   :", u32(36))
 
-          name = data[48:64].split(b"\0", 1)[0].decode(
-              "ascii", errors="replace"
-          )
+          print("DT size     :", u32(40))
+          print("DT addr     :", hex(u32(44)))
 
-          cmdline = data[64:576].split(b"\0", 1)[0].decode(
-              "ascii", errors="replace"
-          )
+          name = data[48:64].split(b"\0")[0]
+          cmdline = data[64:576].split(b"\0")[0]
 
-          print("Kernel size :", kernel_size)
-          print("Kernel addr :", hex(kernel_addr))
-          print("Ramdisk size:", ramdisk_size)
-          print("Ramdisk addr:", hex(ramdisk_addr))
-          print("Second size :", second_size)
-          print("Second addr :", hex(second_addr))
-          print("Tags addr   :", hex(tags_addr))
-          print("Page size   :", page_size)
-          print("DT size     :", dt_size)
-          print("DT addr     :", hex(dt_addr))
-          print("Board name  :", name)
+          print("Board name  :", repr(name))
+          print()
+          print("CMDLINE:")
+          print(cmdline.decode("ascii", errors="replace"))
 
           print()
-          print("========== CMDLINE ==========")
-          print(cmdline)
-
-          print()
-          print("========== POSSIBLE HEADER VERSION ==========")
-
-          # Android boot v0/v1/v2-v3 identification heuristics
-          if len(data) >= 1632:
-              print("Header area available for extended inspection.")
+          print("Header bytes 576-2048:")
+          print(data[576:2048].hex())
 
           PY
 
-      - name: Inspect image structure
+      - name: Calculate boot component offsets
         run: |
-          echo "========== BOOT IMAGE STRINGS =========="
-          strings -n 8 work/stock-boot.img | head -n 100 || true
+          python3 <<'PY'
+          import struct
+
+          p = "work/stock-boot.img"
+
+          with open(p, "rb") as f:
+              h = f.read(4096)
+
+          kernel_size = struct.unpack_from("<I", h, 8)[0]
+          ramdisk_size = struct.unpack_from("<I", h, 16)[0]
+          second_size = struct.unpack_from("<I", h, 24)[0]
+          page_size = struct.unpack_from("<I", h, 36)[0]
+          dt_size = struct.unpack_from("<I", h, 40)[0]
+
+          def align(x, a):
+              return ((x + a - 1) // a) * a
+
+          header = page_size
+
+          kernel_offset = header
+          ramdisk_offset = kernel_offset + align(kernel_size, page_size)
+          second_offset = ramdisk_offset + align(ramdisk_size, page_size)
+          dt_offset = second_offset + align(second_size, page_size)
+
+          print("======================================")
+          print(" CALCULATED COMPONENT OFFSETS")
+          print("======================================")
+
+          print("Page size       :", page_size)
+
+          print("Header offset   :", hex(0))
+          print("Kernel offset   :", hex(kernel_offset))
+          print("Ramdisk offset  :", hex(ramdisk_offset))
+          print("Second offset   :", hex(second_offset))
+          print("DT offset       :", hex(dt_offset))
+
+          print()
+          print("Kernel end      :", hex(kernel_offset + kernel_size))
+          print("Ramdisk end     :", hex(ramdisk_offset + ramdisk_size))
+
+          print()
+          print("DT size from hdr:", dt_size)
+
+          PY
+
+      - name: Inspect binary signatures
+        run: |
+          echo "======================================"
+          echo " BINARY SIGNATURES"
+          echo "======================================"
+
+          binwalk work/stock-boot.img || true
 
           echo
-          echo "========== IMAGE SIGNATURES =========="
-          grep -aob "ANDROID!" work/stock-boot.img || true
-          grep -aob "DHTB" work/stock-boot.img || true
+          echo "Known compression/signature strings:"
 
-      - name: Upload inspected boot
+          grep -aob "ANDROID!" work/stock-boot.img || true
+          grep -aob "gzip" work/stock-boot.img || true
+          grep -aob "070701" work/stock-boot.img || true
+          grep -aob "Linux" work/stock-boot.img || true
+          grep -aob "DTB" work/stock-boot.img || true
+
+      - name: Extract calculated components
+        run: |
+          python3 <<'PY'
+          import struct
+          import os
+
+          p = "work/stock-boot.img"
+          out = "work/components"
+
+          os.makedirs(out, exist_ok=True)
+
+          with open(p, "rb") as f:
+              h = f.read(4096)
+
+          kernel_size = struct.unpack_from("<I", h, 8)[0]
+          ramdisk_size = struct.unpack_from("<I", h, 16)[0]
+          second_size = struct.unpack_from("<I", h, 24)[0]
+          page_size = struct.unpack_from("<I", h, 36)[0]
+
+          def align(x, a):
+              return ((x + a - 1) // a) * a
+
+          kernel_off = page_size
+          ramdisk_off = kernel_off + align(kernel_size, page_size)
+          second_off = ramdisk_off + align(ramdisk_size, page_size)
+          dt_off = second_off + align(second_size, page_size)
+
+          with open(p, "rb") as f:
+
+              f.seek(kernel_off)
+              kernel = f.read(kernel_size)
+
+              f.seek(ramdisk_off)
+              ramdisk = f.read(ramdisk_size)
+
+              f.seek(dt_off)
+              possible_dt = f.read(min(1024 * 1024, 4 * 1024 * 1024))
+
+          open(out + "/kernel.bin", "wb").write(kernel)
+          open(out + "/ramdisk.bin", "wb").write(ramdisk)
+          open(out + "/possible-dt.bin", "wb").write(possible_dt)
+
+          print("Kernel extracted :", len(kernel))
+          print("Ramdisk extracted:", len(ramdisk))
+          print("Possible DT data :", len(possible_dt))
+
+          print()
+          print("Offsets:")
+          print("kernel =", hex(kernel_off))
+          print("ramdisk =", hex(ramdisk_off))
+          print("dt =", hex(dt_off))
+
+          PY
+
+          echo
+          echo "Extracted files:"
+          ls -lh work/components
+
+      - name: Identify ramdisk and DT
+        run: |
+          echo "======================================"
+          echo " RAMDISK"
+          echo "======================================"
+
+          file work/components/ramdisk.bin
+
+          echo
+          echo "======================================"
+          echo " POSSIBLE DT"
+          echo "======================================"
+
+          file work/components/possible-dt.bin
+
+          echo
+          echo "DTB magic search:"
+          grep -aob $'\xd0\x0d\xfe\xed' work/components/possible-dt.bin || true
+
+          echo
+          echo "======================================"
+          echo " KERNEL"
+          echo "======================================"
+
+          file work/components/kernel.bin
+
+      - name: Upload analysis files
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-Stock-Boot-Inspected
+          name: Redmi9A-Stock-Boot-Deep-Analysis
           path: |
             work/stock-boot.img
+            work/components/kernel.bin
+            work/components/ramdisk.bin
+            work/components/possible-dt.bin
           retention-days: 7
