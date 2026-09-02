@@ -1,178 +1,166 @@
-name: Download Redmi 9A Stock Boot
+name: Inspect Redmi 9A Stock Boot
 
 on:
   workflow_dispatch:
 
 jobs:
-  download:
+  inspect:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Prepare
-        run: |
-          mkdir -p work/chunks work/out
-
-      - name: Parallel download stock ROM
+      - name: Download stock boot artifact
         env:
-          ROM_URL: https://bigota.d.miui.com/V12.5.9.0.RCDINXM/dandelion_in_global_images_V12.5.9.0.RCDINXM_20220915.0000.00_11.0_in_921f22da4d.tgz
-          ROM_SIZE: 2957502060
-          CHUNKS: 32
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: "33605127291"
+          ARTIFACT_NAME: "Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM"
         run: |
-          python3 <<'PY'
-          import os
-          import urllib.request
-          import time
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          mkdir -p work
 
-          URL = os.environ["ROM_URL"]
-          SIZE = int(os.environ["ROM_SIZE"])
-          N = int(os.environ["CHUNKS"])
+          echo "Finding artifact..."
 
-          chunk_dir = "work/chunks"
-          os.makedirs(chunk_dir, exist_ok=True)
+          ARTIFACT_ID=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\") | .id" \
+            | head -n 1)
 
-          chunk_size = (SIZE + N - 1) // N
-
-          def download_chunk(i):
-              start = i * chunk_size
-              end = min(SIZE - 1, start + chunk_size - 1)
-              expected = end - start + 1
-              path = f"{chunk_dir}/chunk_{i:03d}"
-
-              for attempt in range(1, 7):
-                  try:
-                      if os.path.exists(path):
-                          if os.path.getsize(path) == expected:
-                              print(f"[{i+1}/{N}] already complete")
-                              return True
-                          os.remove(path)
-
-                      print(f"[{i+1}/{N}] bytes {start}-{end} (attempt {attempt})")
-
-                      req = urllib.request.Request(
-                          URL,
-                          headers={
-                              "Range": f"bytes={start}-{end}",
-                              "User-Agent": "Mozilla/5.0"
-                          }
-                      )
-
-                      with urllib.request.urlopen(req, timeout=120) as r:
-                          if r.status != 206:
-                              raise RuntimeError(
-                                  f"Server returned HTTP {r.status}, expected 206"
-                              )
-
-                          with open(path, "wb") as f:
-                              while True:
-                                  data = r.read(1024 * 1024)
-                                  if not data:
-                                      break
-                                  f.write(data)
-
-                      actual = os.path.getsize(path)
-
-                      if actual != expected:
-                          raise RuntimeError(
-                              f"Size mismatch: got {actual}, expected {expected}"
-                          )
-
-                      print(f"[{i+1}/{N}] OK")
-                      return True
-
-                  except Exception as e:
-                      print(f"[{i+1}/{N}] FAILED: {e}")
-                      if os.path.exists(path):
-                          os.remove(path)
-                      time.sleep(3 * attempt)
-
-              return False
-
-          with ThreadPoolExecutor(max_workers=16) as executor:
-              futures = [
-                  executor.submit(download_chunk, i)
-                  for i in range(N)
-              ]
-
-              results = [f.result() for f in as_completed(futures)]
-
-          if not all(results):
-              raise SystemExit("One or more chunks failed.")
-
-          print("All chunks downloaded successfully.")
-          PY
-
-      - name: Join chunks
-        run: |
-          cat work/chunks/chunk_* > work/out/rom.tgz
-
-          ACTUAL=$(stat -c%s work/out/rom.tgz)
-          EXPECTED=2957502060
-
-          echo "ROM size: $ACTUAL"
-
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: Final ROM size mismatch!"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ERROR: Artifact not found!"
             exit 1
           fi
 
-          echo "Final ROM size OK."
+          echo "Artifact ID: $ARTIFACT_ID"
 
-      - name: Verify MD5
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > work/stock-artifact.zip
+
+          echo "Artifact downloaded:"
+          ls -lh work/stock-artifact.zip
+
+      - name: Extract boot.img
         run: |
-          echo "Expected:"
-          echo "921f22da4d242430f4ae54999da07b23"
-
-          echo "Actual:"
-          md5sum work/out/rom.tgz
-
-          ACTUAL=$(md5sum work/out/rom.tgz | awk '{print $1}')
-          EXPECTED=921f22da4d242430f4ae54999da07b23
-
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: MD5 mismatch!"
-            exit 1
-          fi
-
-          echo "MD5 VERIFIED."
-
-      - name: Find boot.img
-        run: |
-          echo "Searching for boot.img..."
-
-          tar -tzf work/out/rom.tgz | grep -E '(^|/)boot\.img$' || true
-
-          BOOT_PATH=$(tar -tzf work/out/rom.tgz | grep -E '(^|/)boot\.img$' | head -n 1)
-
-          if [ -z "$BOOT_PATH" ]; then
-            echo "ERROR: boot.img not found!"
-            exit 1
-          fi
-
-          echo "Found: $BOOT_PATH"
-
-          tar -xzf work/out/rom.tgz \
-            -C work \
-            "$BOOT_PATH"
-
           mkdir -p work/boot
 
-          cp "work/$BOOT_PATH" work/boot/stock-boot.img
+          unzip -o work/stock-artifact.zip -d work/boot
 
-          echo "Boot image:"
-          ls -lh work/boot/stock-boot.img
+          echo "Contents:"
+          find work/boot -type f -exec ls -lh {} \;
 
-      - name: Inspect stock boot.img
+          BOOT=$(find work/boot -name "stock-boot.img" -type f | head -n 1)
+
+          if [ -z "$BOOT" ]; then
+            echo "ERROR: stock-boot.img not found!"
+            exit 1
+          fi
+
+          cp "$BOOT" work/stock-boot.img
+
+          echo "Stock boot image:"
+          ls -lh work/stock-boot.img
+
+      - name: Verify stock boot
         run: |
-          file work/boot/stock-boot.img
-          ls -lh work/boot/stock-boot.img
+          echo "========== FILE =========="
+          file work/stock-boot.img
 
-          echo "First 64 bytes:"
-          xxd -l 64 work/boot/stock-boot.img
+          echo
+          echo "========== SIZE =========="
+          stat -c "Size: %s bytes" work/stock-boot.img
 
-      - name: Upload stock boot.img
+          echo
+          echo "========== SHA256 =========="
+          sha256sum work/stock-boot.img
+
+          echo
+          echo "========== MD5 =========="
+          md5sum work/stock-boot.img
+
+          echo
+          echo "========== BOOT MAGIC =========="
+          xxd -l 16 work/stock-boot.img
+
+      - name: Parse Android boot header
+        run: |
+          python3 <<'PY'
+          import struct
+
+          path = "work/stock-boot.img"
+
+          with open(path, "rb") as f:
+              data = f.read(4096)
+
+          print("========== ANDROID BOOT HEADER ==========")
+
+          magic = data[0:8]
+          print("Magic:", magic)
+
+          if magic != b"ANDROID!":
+              print("ERROR: Not a standard Android boot image!")
+              raise SystemExit(1)
+
+          kernel_size = struct.unpack_from("<I", data, 8)[0]
+          kernel_addr = struct.unpack_from("<I", data, 12)[0]
+
+          ramdisk_size = struct.unpack_from("<I", data, 16)[0]
+          ramdisk_addr = struct.unpack_from("<I", data, 20)[0]
+
+          second_size = struct.unpack_from("<I", data, 24)[0]
+          second_addr = struct.unpack_from("<I", data, 28)[0]
+
+          tags_addr = struct.unpack_from("<I", data, 32)[0]
+          page_size = struct.unpack_from("<I", data, 36)[0]
+
+          dt_size = struct.unpack_from("<I", data, 40)[0]
+          dt_addr = struct.unpack_from("<I", data, 44)[0]
+
+          name = data[48:64].split(b"\0", 1)[0].decode(
+              "ascii", errors="replace"
+          )
+
+          cmdline = data[64:576].split(b"\0", 1)[0].decode(
+              "ascii", errors="replace"
+          )
+
+          print("Kernel size :", kernel_size)
+          print("Kernel addr :", hex(kernel_addr))
+          print("Ramdisk size:", ramdisk_size)
+          print("Ramdisk addr:", hex(ramdisk_addr))
+          print("Second size :", second_size)
+          print("Second addr :", hex(second_addr))
+          print("Tags addr   :", hex(tags_addr))
+          print("Page size   :", page_size)
+          print("DT size     :", dt_size)
+          print("DT addr     :", hex(dt_addr))
+          print("Board name  :", name)
+
+          print()
+          print("========== CMDLINE ==========")
+          print(cmdline)
+
+          print()
+          print("========== POSSIBLE HEADER VERSION ==========")
+
+          # Android boot v0/v1/v2-v3 identification heuristics
+          if len(data) >= 1632:
+              print("Header area available for extended inspection.")
+
+          PY
+
+      - name: Inspect image structure
+        run: |
+          echo "========== BOOT IMAGE STRINGS =========="
+          strings -n 8 work/stock-boot.img | head -n 100 || true
+
+          echo
+          echo "========== IMAGE SIGNATURES =========="
+          grep -aob "ANDROID!" work/stock-boot.img || true
+          grep -aob "DHTB" work/stock-boot.img || true
+
+      - name: Upload inspected boot
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM
-          path: work/boot/stock-boot.img
+          name: Redmi9A-Stock-Boot-Inspected
+          path: |
+            work/stock-boot.img
           retention-days: 7
