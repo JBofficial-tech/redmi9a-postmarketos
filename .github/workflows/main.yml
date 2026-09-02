@@ -67,33 +67,23 @@ jobs:
       # ---------------------------------------------------------
       # 2. Build kernel
       # ---------------------------------------------------------
-      - name: Prepare kernel source
-        run: |
-          set -e
-
-          git clone --depth=1 \
-            --branch mt6765 \
-            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
-            kernel
-
       - name: Build Redmi 9A kernel and DTB
-        working-directory: kernel
-        run: |
-          set -e
+  working-directory: kernel
+  run: |
+    set -e
 
-          export ARCH=arm64
+    export ARCH=arm64
 
-          make O=out mt6765_defconfig
+    make O=out mt6765_defconfig
 
-          # Redmi 9A device tree
-          make -j"$(nproc)" O=out \
-            Image \
-            arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
+    # Redmi 9A device tree
+    make -j"$(nproc)" O=out \
+      Image \
+      mediatek/mt6762g-xiaomi-dandelion.dtb
 
-          echo "=== BUILD OUTPUT ==="
-
-          ls -lh out/arch/arm64/boot/Image
-          ls -lh out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
+    echo "=== BUILD OUTPUT ==="
+    ls -lh out/arch/arm64/boot/Image
+    ls -lh out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
 
       # ---------------------------------------------------------
       # 3. Copy required components
