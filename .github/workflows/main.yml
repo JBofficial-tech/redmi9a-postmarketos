@@ -1,175 +1,178 @@
-name: Redmi 9A - Stock Boot Inspector
+name: Download Redmi 9A Stock Boot
 
 on:
   workflow_dispatch:
 
 jobs:
-  inspect-stock-boot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+  download:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Install tools
+      - name: Prepare
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            wget \
-            curl \
-            file \
-            binwalk \
-            xz-utils \
-            gzip \
-            tar \
-            unzip \
-            python3
+          mkdir -p work/chunks work/out
 
-      - name: Download official Xiaomi ROM
+      - name: Parallel download stock ROM
+        env:
+          ROM_URL: https://bigota.d.miui.com/V12.5.9.0.RCDINXM/dandelion_in_global_images_V12.5.9.0.RCDINXM_20220915.0000.00_11.0_in_921f22da4d.tgz
+          ROM_SIZE: 2957502060
+          CHUNKS: 32
         run: |
-          mkdir -p work
+          python3 <<'PY'
+          import os
+          import urllib.request
+          import time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
-          URL="https://bigota.d.miui.com/V12.5.9.0.RCDINXM/dandelion_in_global_images_V12.5.9.0.RCDINXM_20220915.0000.00_11.0_in_921f22da4d.tgz"
+          URL = os.environ["ROM_URL"]
+          SIZE = int(os.environ["ROM_SIZE"])
+          N = int(os.environ["CHUNKS"])
 
-          echo "Downloading official Xiaomi ROM..."
-          echo "$URL"
+          chunk_dir = "work/chunks"
+          os.makedirs(chunk_dir, exist_ok=True)
 
-          wget \
-            --progress=dot:giga \
-            --show-progress \
-            --tries=5 \
-            --timeout=60 \
-            -O work/rom.tgz \
-            "$URL"
+          chunk_size = (SIZE + N - 1) // N
 
-          echo
-          echo "=== FILE ==="
-          ls -lh work/rom.tgz
-          file work/rom.tgz
+          def download_chunk(i):
+              start = i * chunk_size
+              end = min(SIZE - 1, start + chunk_size - 1)
+              expected = end - start + 1
+              path = f"{chunk_dir}/chunk_{i:03d}"
+
+              for attempt in range(1, 7):
+                  try:
+                      if os.path.exists(path):
+                          if os.path.getsize(path) == expected:
+                              print(f"[{i+1}/{N}] already complete")
+                              return True
+                          os.remove(path)
+
+                      print(f"[{i+1}/{N}] bytes {start}-{end} (attempt {attempt})")
+
+                      req = urllib.request.Request(
+                          URL,
+                          headers={
+                              "Range": f"bytes={start}-{end}",
+                              "User-Agent": "Mozilla/5.0"
+                          }
+                      )
+
+                      with urllib.request.urlopen(req, timeout=120) as r:
+                          if r.status != 206:
+                              raise RuntimeError(
+                                  f"Server returned HTTP {r.status}, expected 206"
+                              )
+
+                          with open(path, "wb") as f:
+                              while True:
+                                  data = r.read(1024 * 1024)
+                                  if not data:
+                                      break
+                                  f.write(data)
+
+                      actual = os.path.getsize(path)
+
+                      if actual != expected:
+                          raise RuntimeError(
+                              f"Size mismatch: got {actual}, expected {expected}"
+                          )
+
+                      print(f"[{i+1}/{N}] OK")
+                      return True
+
+                  except Exception as e:
+                      print(f"[{i+1}/{N}] FAILED: {e}")
+                      if os.path.exists(path):
+                          os.remove(path)
+                      time.sleep(3 * attempt)
+
+              return False
+
+          with ThreadPoolExecutor(max_workers=16) as executor:
+              futures = [
+                  executor.submit(download_chunk, i)
+                  for i in range(N)
+              ]
+
+              results = [f.result() for f in as_completed(futures)]
+
+          if not all(results):
+              raise SystemExit("One or more chunks failed.")
+
+          print("All chunks downloaded successfully.")
+          PY
+
+      - name: Join chunks
+        run: |
+          cat work/chunks/chunk_* > work/out/rom.tgz
+
+          ACTUAL=$(stat -c%s work/out/rom.tgz)
+          EXPECTED=2957502060
+
+          echo "ROM size: $ACTUAL"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: Final ROM size mismatch!"
+            exit 1
+          fi
+
+          echo "Final ROM size OK."
 
       - name: Verify MD5
         run: |
-          EXPECTED="921f22da4d242430f4ae54999da07b23"
-          ACTUAL=$(md5sum work/rom.tgz | awk '{print $1}')
+          echo "Expected:"
+          echo "921f22da4d242430f4ae54999da07b23"
 
-          echo "Expected: $EXPECTED"
-          echo "Actual:   $ACTUAL"
+          echo "Actual:"
+          md5sum work/out/rom.tgz
+
+          ACTUAL=$(md5sum work/out/rom.tgz | awk '{print $1}')
+          EXPECTED=921f22da4d242430f4ae54999da07b23
 
           if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: MD5 mismatch."
-            echo "The downloaded file is not the expected ROM."
+            echo "ERROR: MD5 mismatch!"
             exit 1
           fi
 
-          echo "MD5 verification PASSED."
+          echo "MD5 VERIFIED."
 
-      - name: Extract ROM
+      - name: Find boot.img
         run: |
-          mkdir -p work/rom
+          echo "Searching for boot.img..."
 
-          tar -xzf work/rom.tgz \
-            -C work/rom
+          tar -tzf work/out/rom.tgz | grep -E '(^|/)boot\.img$' || true
 
-          echo "=== ROM CONTENT ==="
-          find work/rom -maxdepth 3 -type f | head -150
+          BOOT_PATH=$(tar -tzf work/out/rom.tgz | grep -E '(^|/)boot\.img$' | head -n 1)
 
-      - name: Find stock boot.img
-        run: |
-          BOOT=$(find work/rom \
-            -type f \
-            -name "boot.img" \
-            | head -1)
-
-          if [ -z "$BOOT" ]; then
-            echo "ERROR: boot.img not found."
+          if [ -z "$BOOT_PATH" ]; then
+            echo "ERROR: boot.img not found!"
             exit 1
           fi
 
-          echo "Found stock boot:"
-          echo "$BOOT"
+          echo "Found: $BOOT_PATH"
 
-          mkdir -p inspection
-          cp "$BOOT" inspection/stock-boot.img
+          tar -xzf work/out/rom.tgz \
+            -C work \
+            "$BOOT_PATH"
 
-      - name: Inspect boot image
+          mkdir -p work/boot
+
+          cp "work/$BOOT_PATH" work/boot/stock-boot.img
+
+          echo "Boot image:"
+          ls -lh work/boot/stock-boot.img
+
+      - name: Inspect stock boot.img
         run: |
-          BOOT="inspection/stock-boot.img"
+          file work/boot/stock-boot.img
+          ls -lh work/boot/stock-boot.img
 
-          echo "=== FILE TYPE ==="
-          file "$BOOT" | tee inspection/file.txt
+          echo "First 64 bytes:"
+          xxd -l 64 work/boot/stock-boot.img
 
-          echo
-          echo "=== SIZE ==="
-          stat -c '%n: %s bytes' "$BOOT" \
-            | tee inspection/size.txt
-
-          echo
-          echo "=== BINWALK ==="
-          binwalk "$BOOT" \
-            | tee inspection/binwalk.txt
-
-      - name: Detect boot signatures
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("inspection/stock-boot.img")
-          data = p.read_bytes()
-
-          print("Boot image size:", len(data), "bytes")
-          print()
-
-          signatures = [
-              b"ANDROID!",
-              b"VNDRBOOT",
-              b"AVB0",
-              b"SEANDROIDENFORCE",
-          ]
-
-          for sig in signatures:
-              pos = data.find(sig)
-
-              if pos >= 0:
-                  print(
-                      sig.decode(errors="replace"),
-                      "found at offset",
-                      pos
-                  )
-              else:
-                  print(
-                      sig.decode(errors="replace"),
-                      "not found"
-                  )
-          PY
-
-      - name: Extract strings
-        run: |
-          strings inspection/stock-boot.img \
-            | head -300 \
-            | tee inspection/strings.txt
-
-      - name: Create summary
-        run: |
-          {
-            echo "================================="
-            echo "Redmi 9A Stock Boot Inspection"
-            echo "================================="
-            echo
-            echo "Device: Redmi 9A"
-            echo "Codename: dandelion"
-            echo "Region: India"
-            echo "MIUI: V12.5.9.0.RCDINXM"
-            echo "Android: 11"
-            echo
-            echo "Expected ROM MD5:"
-            echo "921f22da4d242430f4ae54999da07b23"
-            echo
-            echo "Inspection files:"
-            ls -lh inspection/
-          } > inspection/SUMMARY.txt
-
-          cat inspection/SUMMARY.txt
-
-      - name: Upload inspection
+      - name: Upload stock boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: redmi9a-stock-boot-inspection
-          path: inspection/
+          name: Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM
+          path: work/boot/stock-boot.img
+          retention-days: 7
