@@ -1,393 +1,226 @@
-name: Deep Inspect Redmi 9A Stock Boot
+name: Build Redmi 9A pmOS Test Boot
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
-  inspect:
-    runs-on: ubuntu-latest
+  package:
+    runs-on: ubuntu-22.04
 
     steps:
-
-      - name: Download stock boot artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: "33605127291"
-          ARTIFACT_NAME: "Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM"
-        run: |
-          set -e
-
-          mkdir -p work
-
-          echo "Finding stock boot artifact..."
-
-          ARTIFACT_ID=$(gh api \
-            "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
-            --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\") | .id" \
-            | head -n 1)
-
-          if [ -z "$ARTIFACT_ID" ]; then
-            echo "ERROR: Artifact not found!"
-            exit 1
-          fi
-
-          echo "Artifact ID: $ARTIFACT_ID"
-
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            > work/artifact.zip
-
-          unzip -o work/artifact.zip -d work/
-
-          test -f work/stock-boot.img
-
-          echo "Stock boot extracted:"
-          ls -lh work/stock-boot.img
-
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            binwalk \
-            cpio \
+            git \
+            wget \
+            unzip \
             gzip \
-            xz-utils \
-            lz4 \
-            zstd \
-            file
+            file \
+            binwalk \
+            python3 \
+            cpio
 
-
-      - name: Basic information
+      # ---------------------------------------------------------
+      # 1. Download STOCK Redmi 9A boot artifact
+      # ---------------------------------------------------------
+      - name: Download stock boot artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "================================"
-          echo " STOCK BOOT INFORMATION"
-          echo "================================"
+          set -e
 
-          echo
-          echo "FILE:"
-          file work/stock-boot.img
+          mkdir -p stock
 
-          echo
-          echo "SIZE:"
-          stat -c "%s bytes" work/stock-boot.img
+          echo "Downloading verified stock boot artifact..."
 
-          echo
-          echo "SHA256:"
-          sha256sum work/stock-boot.img
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/actions/artifacts/9842100784/zip \
+            > stock/artifact.zip
 
-          echo
-          echo "MD5:"
-          md5sum work/stock-boot.img
+          unzip -o stock/artifact.zip -d stock
 
-          echo
-          echo "MAGIC:"
-          xxd -l 64 work/stock-boot.img
+          echo "Stock files:"
+          find stock -type f -maxdepth 3 -print
 
+          STOCK=$(find stock -type f -name "stock-boot.img" | head -n1)
 
-      - name: Parse Android boot header
+          if [ -z "$STOCK" ]; then
+            echo "ERROR: stock-boot.img not found"
+            exit 1
+          fi
+
+          cp "$STOCK" stock-boot.img
+
+          echo "Stock boot:"
+          ls -lh stock-boot.img
+          file stock-boot.img
+
+      # ---------------------------------------------------------
+      # 2. Build kernel
+      # ---------------------------------------------------------
+      - name: Prepare kernel source
         run: |
-          python3 - <<'PY'
-          import struct
+          set -e
 
-          path = "work/stock-boot.img"
+          git clone --depth=1 \
+            --branch mt6765 \
+            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
+            kernel
 
-          with open(path, "rb") as f:
-              data = f.read(4096)
-
-          print("================================")
-          print(" ANDROID BOOT HEADER")
-          print("================================")
-
-          magic = data[0:8]
-          print("Magic:", magic)
-
-          if magic != b"ANDROID!":
-              raise SystemExit("ERROR: Not Android boot image")
-
-          def u32(offset):
-              return struct.unpack_from("<I", data, offset)[0]
-
-          kernel_size = u32(8)
-          kernel_addr = u32(12)
-
-          ramdisk_size = u32(16)
-          ramdisk_addr = u32(20)
-
-          second_size = u32(24)
-          second_addr = u32(28)
-
-          tags_addr = u32(32)
-          page_size = u32(36)
-
-          dt_size = u32(40)
-          dt_addr = u32(44)
-
-          name = data[48:64].split(b"\0", 1)[0]
-          cmdline = data[64:576].split(b"\0", 1)[0]
-
-          print("Kernel size :", kernel_size)
-          print("Kernel addr :", hex(kernel_addr))
-
-          print("Ramdisk size:", ramdisk_size)
-          print("Ramdisk addr:", hex(ramdisk_addr))
-
-          print("Second size :", second_size)
-          print("Second addr :", hex(second_addr))
-
-          print("Tags addr   :", hex(tags_addr))
-
-          print("Page size   :", page_size)
-
-          print("DT size     :", dt_size)
-          print("DT addr     :", hex(dt_addr))
-
-          print("Board name  :", repr(name))
-
-          print()
-          print("CMDLINE:")
-          print(cmdline.decode("ascii", errors="replace"))
-
-          PY
-
-
-      - name: Calculate component offsets
+      - name: Build Redmi 9A kernel and DTB
+        working-directory: kernel
         run: |
-          python3 - <<'PY'
-          import struct
+          set -e
 
-          path = "work/stock-boot.img"
+          export ARCH=arm64
 
-          with open(path, "rb") as f:
-              data = f.read(4096)
+          make O=out mt6765_defconfig
 
-          kernel_size = struct.unpack_from("<I", data, 8)[0]
-          ramdisk_size = struct.unpack_from("<I", data, 16)[0]
-          second_size = struct.unpack_from("<I", data, 24)[0]
-          page_size = struct.unpack_from("<I", data, 36)[0]
+          # Redmi 9A device tree
+          make -j"$(nproc)" O=out \
+            Image \
+            arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
 
-          def align(value, alignment):
-              return ((value + alignment - 1) // alignment) * alignment
+          echo "=== BUILD OUTPUT ==="
 
-          kernel_offset = page_size
+          ls -lh out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
 
-          ramdisk_offset = (
-              kernel_offset +
-              align(kernel_size, page_size)
-          )
-
-          second_offset = (
-              ramdisk_offset +
-              align(ramdisk_size, page_size)
-          )
-
-          dt_offset = (
-              second_offset +
-              align(second_size, page_size)
-          )
-
-          print("================================")
-          print(" COMPONENT OFFSETS")
-          print("================================")
-
-          print("Page size     :", page_size)
-          print("Kernel offset :", hex(kernel_offset))
-          print("Ramdisk offset:", hex(ramdisk_offset))
-          print("Second offset :", hex(second_offset))
-          print("DT offset     :", hex(dt_offset))
-
-          print()
-          print("Kernel size   :", kernel_size)
-          print("Ramdisk size  :", ramdisk_size)
-          print("Second size   :", second_size)
-
-          print()
-          print(
-              "Kernel end    :",
-              hex(kernel_offset + kernel_size)
-          )
-
-          print(
-              "Ramdisk end   :",
-              hex(ramdisk_offset + ramdisk_size)
-          )
-
-          PY
-
-
-      - name: Binwalk analysis
+      # ---------------------------------------------------------
+      # 3. Copy required components
+      # ---------------------------------------------------------
+      - name: Prepare components
         run: |
-          echo "================================"
-          echo " BINWALK"
-          echo "================================"
+          set -e
 
-          binwalk work/stock-boot.img || true
+          mkdir -p work
 
+          cp kernel/out/arch/arm64/boot/Image \
+            work/Image
 
-      - name: Search DTB and compression signatures
+          cp kernel/out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb \
+            work/dandelion.dtb
+
+          echo "=== COMPONENTS ==="
+          file work/Image
+          file work/dandelion.dtb
+          ls -lh work/
+
+      # ---------------------------------------------------------
+      # 4. Install mkbootimg/unpackbootimg
+      # ---------------------------------------------------------
+      - name: Get Android boot image tools
         run: |
-          echo "================================"
-          echo " SIGNATURE SEARCH"
-          echo "================================"
+          set -e
 
-          echo
-          echo "ANDROID:"
-          grep -aob "ANDROID!" work/stock-boot.img || true
+          mkdir -p tools
 
-          echo
-          echo "DTB:"
-          grep -aob $'\xd0\x0d\xfe\xed' work/stock-boot.img || true
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg \
+            tools/mkbootimg
 
-          echo
-          echo "CPIO:"
-          grep -aob "070701" work/stock-boot.img || true
+          python3 tools/mkbootimg/mkbootimg.py --help | head -30
+          python3 tools/mkbootimg/unpack_bootimg.py --help | head -30
 
-          echo
-          echo "GZIP:"
-          grep -aob $'\x1f\x8b\x08' work/stock-boot.img || true
-
-          echo
-          echo "LZ4:"
-          grep -aob $'\x02\x21\x4c\x18' work/stock-boot.img || true
-
-
-      - name: Extract components
+      # ---------------------------------------------------------
+      # 5. Inspect STOCK boot image
+      # ---------------------------------------------------------
+      - name: Unpack stock boot
         run: |
-          python3 - <<'PY'
-          import struct
-          import os
+          set -e
 
-          path = "work/stock-boot.img"
-          out = "work/components"
+          rm -rf stock-unpacked
+          mkdir -p stock-unpacked
 
-          os.makedirs(out, exist_ok=True)
+          python3 tools/mkbootimg/unpack_bootimg.py \
+            --boot_img stock-boot.img \
+            --out stock-unpacked
 
-          with open(path, "rb") as f:
-              header = f.read(4096)
+          echo "=== STOCK BOOT CONTENTS ==="
+          find stock-unpacked -maxdepth 2 -type f -exec ls -lh {} \;
 
-          kernel_size = struct.unpack_from("<I", header, 8)[0]
-          ramdisk_size = struct.unpack_from("<I", header, 16)[0]
-          second_size = struct.unpack_from("<I", header, 24)[0]
-          page_size = struct.unpack_from("<I", header, 36)[0]
+          echo
+          echo "=== STOCK HEADER ==="
 
-          def align(value, alignment):
-              return ((value + alignment - 1) // alignment) * alignment
+          cat stock-unpacked/bootimg.cfg || true
 
-          kernel_offset = page_size
-
-          ramdisk_offset = (
-              kernel_offset +
-              align(kernel_size, page_size)
-          )
-
-          second_offset = (
-              ramdisk_offset +
-              align(ramdisk_size, page_size)
-          )
-
-          dt_offset = (
-              second_offset +
-              align(second_size, page_size)
-          )
-
-          file_size = os.path.getsize(path)
-
-          with open(path, "rb") as f:
-
-              f.seek(kernel_offset)
-              kernel = f.read(kernel_size)
-
-              f.seek(ramdisk_offset)
-              ramdisk = f.read(ramdisk_size)
-
-              f.seek(dt_offset)
-
-              remaining = file_size - dt_offset
-
-              if remaining > 0:
-                  possible_dt = f.read(
-                      min(4 * 1024 * 1024, remaining)
-                  )
-              else:
-                  possible_dt = b""
-
-          open(
-              out + "/kernel.bin",
-              "wb"
-          ).write(kernel)
-
-          open(
-              out + "/ramdisk.bin",
-              "wb"
-          ).write(ramdisk)
-
-          open(
-              out + "/possible-dt.bin",
-              "wb"
-          ).write(possible_dt)
-
-          print("================================")
-          print(" EXTRACTED COMPONENTS")
-          print("================================")
-
-          print("Kernel :", len(kernel), "bytes")
-          print("Ramdisk:", len(ramdisk), "bytes")
-          print("Possible DT:", len(possible_dt), "bytes")
-
-          print()
-          print("Kernel offset :", hex(kernel_offset))
-          print("Ramdisk offset:", hex(ramdisk_offset))
-          print("DT offset     :", hex(dt_offset))
-
-          PY
-
-
-      - name: Identify components
+      # ---------------------------------------------------------
+      # 6. Show exact stock structure
+      # ---------------------------------------------------------
+      - name: Verify stock structure
         run: |
+          set -e
+
           echo "================================"
-          echo " KERNEL"
+          echo "STOCK BOOT VERIFICATION"
           echo "================================"
-          file work/components/kernel.bin
 
           echo
-          echo "================================"
-          echo " RAMDISK"
-          echo "================================"
-          file work/components/ramdisk.bin
+          echo "--- IMAGE ---"
+          ls -lh stock-boot.img
 
           echo
-          echo "================================"
-          echo " POSSIBLE DT"
-          echo "================================"
-          file work/components/possible-dt.bin
+          echo "--- UNPACKED FILES ---"
+          find stock-unpacked -type f -printf '%p %s bytes\n'
 
           echo
-          echo "DTB MAGIC:"
-          grep -aob \
-            $'\xd0\x0d\xfe\xed' \
-            work/components/possible-dt.bin || true
+          echo "--- BINWALK ---"
+          binwalk stock-boot.img || true
 
+          echo
+          echo "--- KERNEL ---"
+          file stock-unpacked/kernel || true
 
-      - name: Inspect ramdisk
+          echo
+          echo "--- RAMDISK ---"
+          file stock-unpacked/ramdisk || true
+
+          echo
+          echo "--- DTB ---"
+          file stock-unpacked/*.dtb 2>/dev/null || true
+
+      # ---------------------------------------------------------
+      # 7. DO NOT automatically flash
+      # ---------------------------------------------------------
+      - name: Safety check
         run: |
-          echo "================================"
-          echo " RAMDISK"
-          echo "================================"
-
-          xxd -l 128 work/components/ramdisk.bin
-
+          echo "=========================================="
+          echo "SAFETY CHECK"
+          echo "=========================================="
           echo
-          file work/components/ramdisk.bin
+          echo "This workflow DOES NOT flash the device."
+          echo
+          echo "Stock boot image:"
+          sha256sum stock-boot.img
+          echo
+          echo "New kernel:"
+          sha256sum work/Image
+          echo
+          echo "Redmi 9A DTB:"
+          sha256sum work/dandelion.dtb
+          echo
+          echo "Packaging stage will only create an artifact."
+          echo "NO fastboot commands are executed."
 
-
-      - name: Upload analysis
+      # ---------------------------------------------------------
+      # 8. Upload everything for inspection
+      # ---------------------------------------------------------
+      - name: Upload packaging files
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-Stock-Boot-Deep-Analysis
+          name: Redmi9A-pmOS-Test-Components
           path: |
-            work/stock-boot.img
-            work/components/kernel.bin
-            work/components/ramdisk.bin
-            work/components/possible-dt.bin
-          retention-days: 7
+            stock-boot.img
+            work/Image
+            work/dandelion.dtb
+            stock-unpacked/
+          if-no-files-found: error
