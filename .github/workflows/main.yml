@@ -1,11 +1,11 @@
-name: Build Redmi 9A pmOS Test Boot
+name: Package Redmi 9A pmOS Test Boot
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   actions: read
+  contents: read
 
 jobs:
   package:
@@ -13,35 +13,130 @@ jobs:
 
     steps:
 
-      # ---------------------------------------------------------
-      # 1. Checkout repository
-      # ---------------------------------------------------------
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ---------------------------------------------------------
-      # 2. Install required tools
-      # ---------------------------------------------------------
-      - name: Install tools
+      # =========================================================
+      # 1. Download previously successful kernel build
+      # =========================================================
+      - name: Download kernel build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
 
-          sudo apt-get update
+          mkdir -p kernel-artifact
 
-          sudo apt-get install -y \
-            git \
-            wget \
-            unzip \
-            gzip \
-            file \
-            binwalk \
-            python3 \
-            cpio
+          echo "Downloading previous successful kernel artifact..."
 
-      # ---------------------------------------------------------
-      # 3. Download STOCK Redmi 9A boot artifact
-      # ---------------------------------------------------------
-      - name: Download stock boot artifact
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts" \
+            > artifacts.json
+
+          python3 - <<'PY'
+          import json
+
+          data = json.load(open("artifacts.json"))
+
+          for a in data.get("artifacts", []):
+              print(
+                  a["id"],
+                  a["name"],
+                  a["expired"],
+                  a["created_at"]
+              )
+          PY
+
+          ARTIFACT_ID=$(python3 - <<'PY'
+          import json
+
+          data = json.load(open("artifacts.json"))
+
+          candidates = []
+
+          for a in data.get("artifacts", []):
+              name = a["name"].lower()
+
+              if a["expired"]:
+                  continue
+
+              if (
+                  "dandelion" in name
+                  or "kernel" in name
+                  or "pmos" in name
+              ):
+                  candidates.append(a)
+
+          if not candidates:
+              raise SystemExit("No suitable kernel artifact found")
+
+          candidates.sort(
+              key=lambda x: x["created_at"],
+              reverse=True
+          )
+
+          print(candidates[0]["id"])
+          PY
+          )
+
+          echo "Selected artifact: $ARTIFACT_ID"
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > kernel-artifact/kernel.zip
+
+          unzip -o kernel-artifact/kernel.zip \
+            -d kernel-artifact/extracted
+
+          echo "=== KERNEL ARTIFACT ==="
+          find kernel-artifact/extracted \
+            -type f \
+            -exec ls -lh {} \;
+
+      # =========================================================
+      # 2. Locate Image and Redmi 9A DTB
+      # =========================================================
+      - name: Locate kernel and DTB
+        run: |
+          set -e
+
+          mkdir -p work
+
+          IMAGE=$(find kernel-artifact/extracted \
+            -type f \
+            -name "Image" \
+            | head -n1)
+
+          DTB=$(find kernel-artifact/extracted \
+            -type f \
+            -name "mt6762g-xiaomi-dandelion.dtb" \
+            | head -n1)
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: Image not found"
+            exit 1
+          fi
+
+          if [ -z "$DTB" ]; then
+            echo "ERROR: Redmi 9A dandelion DTB not found"
+            exit 1
+          fi
+
+          cp "$IMAGE" work/Image
+          cp "$DTB" work/dandelion.dtb
+
+          echo
+          echo "=== SELECTED COMPONENTS ==="
+
+          file work/Image
+          file work/dandelion.dtb
+
+          ls -lh work/Image
+          ls -lh work/dandelion.dtb
+
+      # =========================================================
+      # 3. Download verified stock boot artifact
+      # =========================================================
+      - name: Download stock boot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -49,22 +144,17 @@ jobs:
 
           mkdir -p stock
 
-          echo "=========================================="
-          echo "Downloading verified stock boot artifact"
-          echo "=========================================="
-
           gh api \
             -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/actions/artifacts/9842100784/zip \
-            > stock/artifact.zip
+            "/repos/${{ github.repository }}/actions/artifacts/9842100784/zip" \
+            > stock/stock.zip
 
-          unzip -o stock/artifact.zip -d stock
+          unzip -o stock/stock.zip -d stock/extracted
 
-          echo
-          echo "Stock files:"
-          find stock -maxdepth 3 -type f -print
-
-          STOCK=$(find stock -type f -name "stock-boot.img" | head -n1)
+          STOCK=$(find stock/extracted \
+            -type f \
+            -name "stock-boot.img" \
+            | head -n1)
 
           if [ -z "$STOCK" ]; then
             echo "ERROR: stock-boot.img not found"
@@ -73,159 +163,48 @@ jobs:
 
           cp "$STOCK" stock-boot.img
 
-          echo
-          echo "Stock boot image:"
+          echo "=== STOCK BOOT ==="
           ls -lh stock-boot.img
           file stock-boot.img
 
-      # ---------------------------------------------------------
-      # 4. Prepare Redmi 9A kernel source
-      # ---------------------------------------------------------
-      - name: Prepare kernel source
+          echo
+          echo "SHA256:"
+          sha256sum stock-boot.img
+
+      # =========================================================
+      # 4. Install Android boot image tools
+      # =========================================================
+      - name: Install Android boot tools
         run: |
           set -e
 
-          echo "=========================================="
-          echo "Preparing Redmi 9A kernel source"
-          echo "=========================================="
+          sudo apt-get update
 
-          rm -rf kernel
+          sudo apt-get install -y \
+            python3 \
+            python3-pip \
+            unzip \
+            gzip \
+            file \
+            binwalk \
+            cpio \
+            git
 
-          git clone --depth=1 \
-            --branch mt6765 \
-            https://github.com/dandelion64-Archives/linux-mt6762-garden.git \
-            kernel
-
-          echo
-          echo "Kernel source prepared."
-
-          test -f kernel/Makefile
-          test -d kernel/arch/arm64
-
-      # ---------------------------------------------------------
-      # 5. Build Redmi 9A kernel + DTB
-      # ---------------------------------------------------------
-      - name: Build Redmi 9A kernel and DTB
-        working-directory: kernel
-        run: |
-          set -e
-
-          export ARCH=arm64
-
-          echo "=========================================="
-          echo "Building Redmi 9A kernel"
-          echo "=========================================="
-
-          rm -rf out
-
-          mkdir -p out
-
-          echo
-          echo "Using mt6765_defconfig..."
-
-          make O=out mt6765_defconfig
-
-          echo
-          echo "=========================================="
-          echo "Building kernel Image"
-          echo "=========================================="
-
-          make -j"$(nproc)" O=out Image
-
-          echo
-          echo "=========================================="
-          echo "Building Redmi 9A DTB"
-          echo "=========================================="
-
-          make -j"$(nproc)" O=out \
-            mediatek/mt6762g-xiaomi-dandelion.dtb
-
-          echo
-          echo "=========================================="
-          echo "BUILD OUTPUT"
-          echo "=========================================="
-
-          test -f out/arch/arm64/boot/Image
-          test -f out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
-
-          echo
-          echo "--- Kernel Image ---"
-          ls -lh out/arch/arm64/boot/Image
-
-          echo
-          echo "--- Redmi 9A DTB ---"
-          ls -lh out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb
-
-          echo
-          echo "Kernel + DTB build completed successfully."
-
-      # ---------------------------------------------------------
-      # 6. Prepare components
-      # ---------------------------------------------------------
-      - name: Prepare components
-        run: |
-          set -e
-
-          echo "=========================================="
-          echo "Preparing build components"
-          echo "=========================================="
-
-          rm -rf work
-          mkdir -p work
-
-          cp \
-            kernel/out/arch/arm64/boot/Image \
-            work/Image
-
-          cp \
-            kernel/out/arch/arm64/boot/dts/mediatek/mt6762g-xiaomi-dandelion.dtb \
-            work/dandelion.dtb
-
-          echo
-          echo "Components:"
-
-          ls -lh work/
-
-          echo
-          file work/Image
-          file work/dandelion.dtb
-
-      # ---------------------------------------------------------
-      # 7. Get Android boot image tools
-      # ---------------------------------------------------------
-      - name: Get Android boot image tools
-        run: |
-          set -e
-
-          echo "=========================================="
-          echo "Getting Android boot image tools"
-          echo "=========================================="
-
-          rm -rf tools
           mkdir -p tools
 
           git clone --depth=1 \
             https://android.googlesource.com/platform/system/tools/mkbootimg \
             tools/mkbootimg
 
-          test -f tools/mkbootimg/mkbootimg.py
-          test -f tools/mkbootimg/unpack_bootimg.py
-
-          echo
-          echo "Android boot image tools ready."
-
-      # ---------------------------------------------------------
-      # 8. Unpack stock boot image
-      # ---------------------------------------------------------
+      # =========================================================
+      # 5. Unpack stock boot
+      # =========================================================
       - name: Unpack stock boot
         run: |
           set -e
 
-          echo "=========================================="
-          echo "Unpacking stock Redmi 9A boot image"
-          echo "=========================================="
-
           rm -rf stock-unpacked
+
           mkdir -p stock-unpacked
 
           python3 tools/mkbootimg/unpack_bootimg.py \
@@ -233,102 +212,115 @@ jobs:
             --out stock-unpacked
 
           echo
-          echo "=== STOCK BOOT CONTENTS ==="
+          echo "======================================"
+          echo "STOCK BOOT CONTENTS"
+          echo "======================================"
 
           find stock-unpacked \
-            -maxdepth 2 \
             -type f \
             -exec ls -lh {} \;
 
           echo
-          echo "=== STOCK HEADER ==="
+          echo "======================================"
+          echo "STOCK BOOT CONFIG"
+          echo "======================================"
 
           if [ -f stock-unpacked/bootimg.cfg ]; then
             cat stock-unpacked/bootimg.cfg
           else
-            echo "bootimg.cfg not generated by this mkbootimg version."
+            echo "bootimg.cfg not produced"
           fi
 
-      # ---------------------------------------------------------
-      # 9. Verify stock structure
-      # ---------------------------------------------------------
-      - name: Verify stock structure
+      # =========================================================
+      # 6. Verify stock components
+      # =========================================================
+      - name: Inspect stock boot
         run: |
           set -e
 
-          echo "=========================================="
-          echo "STOCK BOOT VERIFICATION"
-          echo "=========================================="
-
           echo
-          echo "--- BOOT IMAGE ---"
-          ls -lh stock-boot.img
-          file stock-boot.img
-
-          echo
-          echo "--- UNPACKED FILES ---"
-
-          find stock-unpacked \
-            -type f \
-            -printf '%p %s bytes\n'
-
-          echo
-          echo "--- BINWALK ---"
+          echo "======================================"
+          echo "STOCK BOOT BINWALK"
+          echo "======================================"
 
           binwalk stock-boot.img || true
 
           echo
-          echo "--- KERNEL ---"
+          echo "======================================"
+          echo "STOCK COMPONENT TYPES"
+          echo "======================================"
 
-          file stock-unpacked/kernel || true
+          for f in stock-unpacked/*; do
+              if [ -f "$f" ]; then
+                  echo
+                  echo "FILE: $f"
+                  file "$f"
+                  ls -lh "$f"
+              fi
+          done
 
           echo
-          echo "--- RAMDISK ---"
+          echo "======================================"
+          echo "NEW KERNEL"
+          echo "======================================"
 
-          file stock-unpacked/ramdisk || true
+          file work/Image
+          ls -lh work/Image
 
           echo
-          echo "--- DTB ---"
+          echo "======================================"
+          echo "NEW REDMI 9A DTB"
+          echo "======================================"
 
-          file stock-unpacked/*.dtb 2>/dev/null || true
+          file work/dandelion.dtb
+          ls -lh work/dandelion.dtb
 
-      # ---------------------------------------------------------
-      # 10. Safety check
-      # ---------------------------------------------------------
-      - name: Safety check
+      # =========================================================
+      # 7. Safety verification
+      # =========================================================
+      - name: Safety verification
         run: |
           set -e
 
-          echo "=========================================="
+          echo
+          echo "======================================"
           echo "SAFETY CHECK"
-          echo "=========================================="
+          echo "======================================"
 
           echo
-          echo "This workflow DOES NOT flash the device."
+          echo "This workflow DOES NOT flash the phone."
 
           echo
-          echo "--- STOCK BOOT SHA256 ---"
+          echo "No fastboot command is executed."
+
+          echo
+          echo "No preloader is modified."
+
+          echo
+          echo "No boot partition is written."
+
+          echo
+          echo "Only analysis/package components are produced."
+
+          echo
+          echo "Stock boot SHA256:"
           sha256sum stock-boot.img
 
           echo
-          echo "--- NEW KERNEL SHA256 ---"
+          echo "Kernel SHA256:"
           sha256sum work/Image
 
           echo
-          echo "--- REDMI 9A DTB SHA256 ---"
+          echo "Redmi 9A DTB SHA256:"
           sha256sum work/dandelion.dtb
 
-          echo
-          echo "No fastboot commands are executed."
-          echo "No device is modified."
-
-      # ---------------------------------------------------------
-      # 11. Upload build components
-      # ---------------------------------------------------------
-      - name: Upload packaging files
+      # =========================================================
+      # 8. Upload everything
+      # =========================================================
+      - name: Upload package analysis
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-pmOS-Test-Components
+          name: Redmi9A-pmOS-Package-Analysis
           path: |
             stock-boot.img
             work/Image
