@@ -1,44 +1,243 @@
-      - name: Locate kernel and DTB
+name: Redmi 9A pmOS Boot Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      # =========================================================
+      # 1. Install required tools
+      # =========================================================
+      - name: Install tools
         run: |
           set -e
 
-          mkdir -p work
+          sudo apt-get update
 
-          echo "======================================"
-          echo "SEARCHING DOWNLOADED ARTIFACT"
-          echo "======================================"
+          sudo apt-get install -y \
+            python3 \
+            unzip \
+            gzip \
+            file \
+            binwalk \
+            cpio \
+            git
 
-          find kernel-artifact/extracted \
-            -type f \
-            -printf '%p\n'
+      # =========================================================
+      # 2. Find previous successful kernel artifact
+      # =========================================================
+      - name: Find and download kernel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          rm -rf kernel-artifact
+          mkdir -p kernel-artifact/candidates
+
+          echo "=============================================="
+          echo "SEARCHING GITHUB ACTIONS ARTIFACTS"
+          echo "=============================================="
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            > artifacts.json
 
           echo
-          echo "======================================"
-          echo "SEARCHING FOR KERNEL"
-          echo "======================================"
+          echo "AVAILABLE ARTIFACTS:"
+          echo
 
-          IMAGE=$(find kernel-artifact/extracted \
-            -type f \
-            \( -name "Image" -o -name "Image.gz" \) \
-            | head -n1)
+          python3 - <<'PY'
+          import json
 
-          if [ -z "$IMAGE" ]; then
-            echo "ERROR: Kernel Image/Image.gz not found"
+          data = json.load(open("artifacts.json"))
+
+          for a in data.get("artifacts", []):
+              print(
+                  f'ID={a["id"]} | '
+                  f'NAME={a["name"]} | '
+                  f'EXPIRED={a["expired"]} | '
+                  f'CREATED={a["created_at"]}'
+              )
+          PY
+
+          echo
+          echo "=============================================="
+          echo "SELECTING KERNEL CANDIDATES"
+          echo "=============================================="
+
+          python3 - <<'PY'
+          import json
+
+          data = json.load(open("artifacts.json"))
+
+          candidates = []
+
+          for a in data.get("artifacts", []):
+
+              if a["expired"]:
+                  continue
+
+              name = a["name"].lower()
+
+              # Ignore the known stock boot artifact.
+              if "stock-boot" in name:
+                  continue
+
+              if (
+                  "kernel" in name
+                  or "dandelion" in name
+                  or "pmos" in name
+              ):
+                  candidates.append(a)
+
+          candidates.sort(
+              key=lambda x: x["created_at"],
+              reverse=True
+          )
+
+          with open("candidate_ids.txt", "w") as f:
+              for a in candidates:
+                  f.write(str(a["id"]) + "\n")
+
+          print()
+          print("CANDIDATES:")
+          print()
+
+          for a in candidates:
+              print(a["id"], a["name"])
+          PY
+
+          if [ ! -s candidate_ids.txt ]; then
             echo
-            echo "All downloaded files were:"
-            find kernel-artifact/extracted -type f -print
+            echo "ERROR: No kernel candidate artifacts found."
             exit 1
           fi
 
-          echo "Found kernel:"
-          echo "$IMAGE"
+          FOUND=""
 
-          cp "$IMAGE" work/kernel
+          while read -r ARTIFACT_ID; do
 
-          echo
-          echo "======================================"
-          echo "SEARCHING FOR REDMI 9A DTB"
-          echo "======================================"
+            echo
+            echo "=============================================="
+            echo "CHECKING ARTIFACT ID: $ARTIFACT_ID"
+            echo "=============================================="
+
+            rm -rf kernel-artifact/current
+            mkdir -p kernel-artifact/current
+
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              > kernel-artifact/current.zip
+
+            unzip -oq \
+              kernel-artifact/current.zip \
+              -d kernel-artifact/current || true
+
+            echo
+            echo "FILES INSIDE ARTIFACT:"
+            find kernel-artifact/current \
+              -type f \
+              -printf '%p\n'
+
+            IMAGE=$(find kernel-artifact/current \
+              -type f \
+              \( \
+                -name "Image" \
+                -o -name "Image.gz" \
+              \) \
+              | head -n1)
+
+            DTB=$(find kernel-artifact/current \
+              -type f \
+              \( \
+                -name "mt6762g-xiaomi-dandelion.dtb" \
+                -o -name "dandelion.dtb" \
+              \) \
+              | head -n1)
+
+            echo
+            echo "Kernel found:"
+            echo "${IMAGE:-NO}"
+
+            echo "DTB found:"
+            echo "${DTB:-NO}"
+
+            # We want the artifact containing BOTH.
+            if [ -n "$IMAGE" ] && [ -n "$DTB" ]; then
+
+              echo
+              echo "**********************************************"
+              echo "CORRECT REDMI 9A KERNEL ARTIFACT FOUND"
+              echo "**********************************************"
+              echo
+              echo "Artifact ID : $ARTIFACT_ID"
+              echo "Kernel      : $IMAGE"
+              echo "DTB         : $DTB"
+              echo
+
+              FOUND="yes"
+
+              rm -rf kernel-artifact/extracted
+              mkdir -p kernel-artifact/extracted
+
+              cp -a \
+                kernel-artifact/current/. \
+                kernel-artifact/extracted/
+
+              break
+            fi
+
+          done < candidate_ids.txt
+
+          if [ -z "$FOUND" ]; then
+
+            echo
+            echo "=============================================="
+            echo "ERROR: COMPLETE KERNEL ARTIFACT NOT FOUND"
+            echo "=============================================="
+            echo
+            echo "No artifact contained BOTH:"
+            echo
+            echo "  Image / Image.gz"
+            echo "  mt6762g-xiaomi-dandelion.dtb"
+            echo
+            echo "The artifact list above is required for diagnosis."
+
+            exit 1
+          fi
+
+      # =========================================================
+      # 3. Locate Image and Redmi 9A DTB
+      # =========================================================
+      - name: Prepare kernel components
+        run: |
+          set -e
+
+          rm -rf work
+          mkdir -p work
+
+          echo "=============================================="
+          echo "LOCATING FINAL COMPONENTS"
+          echo "=============================================="
+
+          IMAGE=$(find kernel-artifact/extracted \
+            -type f \
+            \( \
+              -name "Image" \
+              -o -name "Image.gz" \
+            \) \
+            | head -n1)
 
           DTB=$(find kernel-artifact/extracted \
             -type f \
@@ -48,25 +247,272 @@
             \) \
             | head -n1)
 
-          if [ -z "$DTB" ]; then
-            echo "ERROR: Redmi 9A DTB not found"
-            echo
-            echo "All downloaded files were:"
-            find kernel-artifact/extracted -type f -print
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: Kernel Image not found."
             exit 1
           fi
 
-          echo "Found DTB:"
-          echo "$DTB"
+          if [ -z "$DTB" ]; then
+            echo "ERROR: Redmi 9A DTB not found."
+            exit 1
+          fi
+
+          cp "$IMAGE" work/kernel
 
           cp "$DTB" work/dandelion.dtb
 
           echo
-          echo "======================================"
-          echo "SELECTED COMPONENTS"
-          echo "======================================"
+          echo "=============================================="
+          echo "SELECTED KERNEL"
+          echo "=============================================="
 
           file work/kernel
-          file work/dandelion.dtb
+          ls -lh work/kernel
 
-          ls -lh work/
+          echo
+          echo "=============================================="
+          echo "SELECTED REDMI 9A DTB"
+          echo "=============================================="
+
+          file work/dandelion.dtb
+          ls -lh work/dandelion.dtb
+
+          echo
+          echo "SHA256:"
+          sha256sum work/kernel
+          sha256sum work/dandelion.dtb
+
+      # =========================================================
+      # 4. Download verified stock Redmi 9A boot artifact
+      # =========================================================
+      - name: Download stock Redmi 9A boot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          rm -rf stock
+          mkdir -p stock
+
+          echo "=============================================="
+          echo "FINDING STOCK BOOT ARTIFACT"
+          echo "=============================================="
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            > stock-artifacts.json
+
+          STOCK_ID=$(python3 - <<'PY'
+          import json
+
+          data = json.load(open("stock-artifacts.json"))
+
+          exact = []
+
+          for a in data.get("artifacts", []):
+              if a["expired"]:
+                  continue
+
+              name = a["name"].lower()
+
+              if "stock-boot" in name:
+                  exact.append(a)
+
+          exact.sort(
+              key=lambda x: x["created_at"],
+              reverse=True
+          )
+
+          if not exact:
+              raise SystemExit(
+                  "ERROR: Stock boot artifact not found"
+              )
+
+          print(exact[0]["id"])
+          PY
+          )
+
+          echo "Stock artifact ID: $STOCK_ID"
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts/${STOCK_ID}/zip" \
+            > stock/stock.zip
+
+          unzip -oq \
+            stock/stock.zip \
+            -d stock/extracted
+
+          STOCK=$(find stock/extracted \
+            -type f \
+            -name "stock-boot.img" \
+            | head -n1)
+
+          if [ -z "$STOCK" ]; then
+            echo "ERROR: stock-boot.img not found."
+            find stock/extracted -type f -print
+            exit 1
+          fi
+
+          cp "$STOCK" stock-boot.img
+
+          echo
+          echo "=============================================="
+          echo "STOCK BOOT"
+          echo "=============================================="
+
+          file stock-boot.img
+          ls -lh stock-boot.img
+
+          echo
+          echo "SHA256:"
+          sha256sum stock-boot.img
+
+      # =========================================================
+      # 5. Get Android mkbootimg tools
+      # =========================================================
+      - name: Get Android boot image tools
+        run: |
+          set -e
+
+          rm -rf tools
+          mkdir -p tools
+
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg \
+            tools/mkbootimg
+
+          echo
+          echo "mkbootimg tools ready."
+
+      # =========================================================
+      # 6. Unpack STOCK boot.img
+      # =========================================================
+      - name: Unpack stock boot
+        run: |
+          set -e
+
+          rm -rf stock-unpacked
+          mkdir -p stock-unpacked
+
+          echo "=============================================="
+          echo "UNPACKING STOCK BOOT"
+          echo "=============================================="
+
+          python3 tools/mkbootimg/unpack_bootimg.py \
+            --boot_img stock-boot.img \
+            --out stock-unpacked
+
+          echo
+          echo "=============================================="
+          echo "STOCK BOOT FILES"
+          echo "=============================================="
+
+          find stock-unpacked \
+            -type f \
+            -exec ls -lh {} \;
+
+          echo
+          echo "=============================================="
+          echo "STOCK BOOT CONFIG"
+          echo "=============================================="
+
+          if [ -f stock-unpacked/bootimg.cfg ]; then
+            cat stock-unpacked/bootimg.cfg
+          else
+            echo "bootimg.cfg not generated."
+          fi
+
+      # =========================================================
+      # 7. Inspect stock boot
+      # =========================================================
+      - name: Inspect stock structure
+        run: |
+          set -e
+
+          echo
+          echo "=============================================="
+          echo "STOCK BOOT BINWALK"
+          echo "=============================================="
+
+          binwalk stock-boot.img || true
+
+          echo
+          echo "=============================================="
+          echo "STOCK COMPONENT TYPES"
+          echo "=============================================="
+
+          for f in stock-unpacked/*; do
+              if [ -f "$f" ]; then
+                  echo
+                  echo "FILE: $f"
+                  file "$f"
+                  ls -lh "$f"
+              fi
+          done
+
+          echo
+          echo "=============================================="
+          echo "NEW KERNEL COMPONENT"
+          echo "=============================================="
+
+          file work/kernel
+          ls -lh work/kernel
+
+          echo
+          echo "=============================================="
+          echo "NEW REDMI 9A DTB"
+          echo "=============================================="
+
+          file work/dandelion.dtb
+          ls -lh work/dandelion.dtb
+
+      # =========================================================
+      # 8. Safety check
+      # =========================================================
+      - name: Safety check
+        run: |
+          set -e
+
+          echo
+          echo "=============================================="
+          echo "SAFETY CHECK"
+          echo "=============================================="
+
+          echo
+          echo "THIS WORKFLOW DOES NOT FLASH THE PHONE."
+          echo
+          echo "No fastboot command."
+          echo "No adb command."
+          echo "No preloader modification."
+          echo "No partition writing."
+          echo
+          echo "Only kernel/DTB selection and stock boot"
+          echo "analysis are performed."
+          echo
+
+          echo "Stock boot:"
+          sha256sum stock-boot.img
+
+          echo
+          echo "pmOS kernel:"
+          sha256sum work/kernel
+
+          echo
+          echo "Redmi 9A DTB:"
+          sha256sum work/dandelion.dtb
+
+      # =========================================================
+      # 9. Upload analysis artifacts
+      # =========================================================
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: Redmi9A-pmOS-Package-Analysis
+          path: |
+            stock-boot.img
+            work/kernel
+            work/dandelion.dtb
+            stock-unpacked/
+          if-no-files-found: error
