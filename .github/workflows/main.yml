@@ -1,552 +1,355 @@
-name: Redmi 9A Dandelion Compatibility Check
+name: Redmi 9A Stock DT Container Scan
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: read
-
 jobs:
-  compatibility:
-    runs-on: ubuntu-22.04
+  scan:
+    runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # =========================================================
-      # 1. Install tools
-      # =========================================================
-      - name: Install analysis tools
+      - name: Install tools
         run: |
-          set -e
-
           sudo apt-get update
-
           sudo apt-get install -y \
-            python3 \
-            unzip \
-            git \
-            file \
-            binwalk \
             device-tree-compiler \
+            binwalk \
+            file \
+            xxd \
             gzip \
-            cpio
+            unzip
 
-      # =========================================================
-      # 2. Get all Actions artifacts
-      # =========================================================
-      - name: Get artifact list
+      - name: Download stock boot artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
+          mkdir -p input
 
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-            > artifacts.json
+          gh run download 33605127291 \
+            -n Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM \
+            -D input
 
-          echo "=============================================="
-          echo "AVAILABLE ARTIFACTS"
-          echo "=============================================="
+          echo "=== Downloaded files ==="
+          find input -type f -maxdepth 3 -print
 
-          python3 - <<'PY'
-          import json
+      - name: Locate stock boot
+        run: |
+          BOOT=$(find input -type f -name "*.img" | head -n 1)
 
-          data = json.load(open("artifacts.json"))
+          if [ -z "$BOOT" ]; then
+            echo "ERROR: stock boot.img not found"
+            exit 1
+          fi
 
-          for a in data.get("artifacts", []):
-              if not a["expired"]:
-                  print(
-                      f'ID={a["id"]} | '
-                      f'NAME={a["name"]} | '
-                      f'CREATED={a["created_at"]}'
-                  )
+          cp "$BOOT" stock-boot.img
+
+          echo "Using:"
+          ls -lh stock-boot.img
+          file stock-boot.img
+
+      - name: Scan complete boot image for FDT signatures
+        run: |
+          python3 <<'PY'
+          data = open("stock-boot.img", "rb").read()
+
+          signatures = {
+              b"\xd0\x0d\xfe\xed": "STANDARD_FDT",
+              b"\xd7\xb7\xab\x1e": "MEDIATEK_OR_VENDOR_DT"
+          }
+
+          with open("boot-signature-scan.txt", "w") as out:
+              out.write("Redmi 9A Stock Boot DT Signature Scan\n")
+              out.write("=" * 60 + "\n")
+              out.write(f"Boot size: {len(data)} bytes\n\n")
+
+              for sig, name in signatures.items():
+                  offsets = []
+                  pos = 0
+
+                  while True:
+                      pos = data.find(sig, pos)
+
+                      if pos == -1:
+                          break
+
+                      offsets.append(pos)
+                      pos += 1
+
+                  out.write(f"{name} {sig.hex()}\n")
+                  out.write(f"Count: {len(offsets)}\n")
+
+                  for off in offsets:
+                      out.write(
+                          f"  offset=0x{off:X} ({off})\n"
+                      )
+
+                  out.write("\n")
+
+          print(open("boot-signature-scan.txt").read())
           PY
 
-      # =========================================================
-      # 3. Download stock boot artifact
-      # =========================================================
-      - name: Download stock boot
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Analyze possible FDT candidates
         run: |
-          set -e
+          mkdir -p fdt-candidates
 
-          mkdir -p stock
+          python3 <<'PY'
+          import struct
+          import os
 
-          STOCK_ID=$(python3 - <<'PY'
-          import json
-
-          data = json.load(open("artifacts.json"))
+          data = open("stock-boot.img", "rb").read()
+          magic = b"\xd0\x0d\xfe\xed"
 
           candidates = []
+          pos = 0
 
-          for a in data.get("artifacts", []):
-              if a["expired"]:
-                  continue
+          while True:
+              pos = data.find(magic, pos)
 
-              if "stock-boot" in a["name"].lower():
-                  candidates.append(a)
+              if pos == -1:
+                  break
 
-          candidates.sort(
-              key=lambda x: x["created_at"],
-              reverse=True
-          )
+              if pos + 40 <= len(data):
+                  try:
+                      (
+                          f_magic,
+                          totalsize,
+                          off_dt_struct,
+                          off_dt_strings,
+                          off_mem_rsvmap,
+                          version,
+                          last_comp_version,
+                          boot_cpuid_phys,
+                          size_dt_strings,
+                          size_dt_struct
+                      ) = struct.unpack_from(">10I", data, pos)
 
-          if not candidates:
-              raise SystemExit(
-                  "ERROR: Stock boot artifact not found"
+                      valid = (
+                          totalsize >= 40 and
+                          totalsize <= len(data) - pos and
+                          off_dt_struct < totalsize and
+                          off_dt_strings < totalsize and
+                          version >= 1 and
+                          version <= 20
+                      )
+
+                      candidates.append({
+                          "offset": pos,
+                          "totalsize": totalsize,
+                          "off_dt_struct": off_dt_struct,
+                          "off_dt_strings": off_dt_strings,
+                          "off_mem_rsvmap": off_mem_rsvmap,
+                          "version": version,
+                          "last_comp_version": last_comp_version,
+                          "size_dt_strings": size_dt_strings,
+                          "size_dt_struct": size_dt_struct,
+                          "valid": valid
+                      })
+
+                      if valid:
+                          name = f"candidate_{pos:08X}.dtb"
+                          with open(
+                              os.path.join("fdt-candidates", name),
+                              "wb"
+                          ) as f:
+                              f.write(data[pos:pos + totalsize])
+
+                  except Exception as e:
+                      print("Parse error at", hex(pos), e)
+
+              pos += 1
+
+          with open("fdt-candidates.txt", "w") as out:
+              out.write("Standard FDT Candidate Analysis\n")
+              out.write("=" * 70 + "\n\n")
+
+              if not candidates:
+                  out.write("NO d00dfeed signatures found.\n")
+              else:
+                  for c in candidates:
+                      out.write(
+                          f"Offset: 0x{c['offset']:X}\n"
+                          f"Total size: {c['totalsize']}\n"
+                          f"Version: {c['version']}\n"
+                          f"Last compatible version: {c['last_comp_version']}\n"
+                          f"Structure offset: 0x{c['off_dt_struct']:X}\n"
+                          f"Strings offset: 0x{c['off_dt_strings']:X}\n"
+                          f"Structure size: {c['size_dt_struct']}\n"
+                          f"Strings size: {c['size_dt_strings']}\n"
+                          f"VALID: {c['valid']}\n"
+                          + "-" * 70 + "\n"
+                      )
+
+          print(open("fdt-candidates.txt").read())
+          PY
+
+      - name: Validate extracted FDT candidates
+        run: |
+          {
+            echo "FDT validation"
+            echo "=============="
+          } > fdt-validation.txt
+
+          shopt -s nullglob
+
+          files=(fdt-candidates/*.dtb)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No valid FDT candidates extracted." | tee -a fdt-validation.txt
+          else
+            for dtb in "${files[@]}"; do
+              echo "" | tee -a fdt-validation.txt
+              echo "FILE: $dtb" | tee -a fdt-validation.txt
+
+              dtc -I dtb -O dts "$dtb" \
+                -o "${dtb%.dtb}.dts" \
+                2>&1 | tee -a fdt-validation.txt || true
+            done
+          fi
+
+      - name: Inspect MediaTek/vendor DT magic
+        run: |
+          python3 <<'PY'
+          import struct
+
+          data = open("stock-boot.img", "rb").read()
+          magic = b"\xd7\xb7\xab\x1e"
+
+          with open("mediatek-dt-analysis.txt", "w") as out:
+              out.write("MediaTek/Vendor DT Signature Analysis\n")
+              out.write("=" * 70 + "\n")
+
+              pos = 0
+              count = 0
+
+              while True:
+                  pos = data.find(magic, pos)
+
+                  if pos == -1:
+                      break
+
+                  count += 1
+
+                  out.write(f"\nOccurrence #{count}\n")
+                  out.write(f"Offset: 0x{pos:X} ({pos})\n")
+
+                  chunk = data[pos:pos + 128]
+
+                  out.write("Hex dump:\n")
+
+                  for i in range(0, len(chunk), 16):
+                      row = chunk[i:i+16]
+                      out.write(
+                          f"{pos+i:08X}: "
+                          + " ".join(f"{b:02X}" for b in row)
+                          + "\n"
+                      )
+
+                  if pos + 64 <= len(data):
+                      words = struct.unpack_from(
+                          ">16I",
+                          data,
+                          pos
+                      )
+
+                      out.write("\nBig-endian 32-bit words:\n")
+
+                      for i, word in enumerate(words):
+                          out.write(
+                              f"+0x{i*4:02X}: 0x{word:08X} ({word})\n"
+                          )
+
+                  pos += 1
+
+              out.write(
+                  f"\nTotal {magic.hex()} occurrences: {count}\n"
               )
 
-          print(candidates[0]["id"])
-          PY
-          )
-
-          echo "Stock artifact ID: $STOCK_ID"
-
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/actions/artifacts/${STOCK_ID}/zip" \
-            > stock/stock.zip
-
-          unzip -oq stock/stock.zip \
-            -d stock/extracted
-
-          STOCK=$(find stock/extracted \
-            -type f \
-            -name "stock-boot.img" \
-            | head -n1)
-
-          if [ -z "$STOCK" ]; then
-            echo "ERROR: stock-boot.img not found"
-            exit 1
-          fi
-
-          cp "$STOCK" stock-boot.img
-
-          echo
-          echo "Stock boot:"
-          file stock-boot.img
-          ls -lh stock-boot.img
-
-      # =========================================================
-      # 4. Download kernel/DTB artifact
-      # =========================================================
-      - name: Download kernel and DTB artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-
-          rm -rf kernel-artifact
-          mkdir -p kernel-artifact/candidates
-
-          python3 - <<'PY'
-          import json
-
-          data = json.load(open("artifacts.json"))
-
-          candidates = []
-
-          for a in data.get("artifacts", []):
-              if a["expired"]:
-                  continue
-
-              name = a["name"].lower()
-
-              if "stock-boot" in name:
-                  continue
-
-              if (
-                  "kernel" in name
-                  or "dandelion" in name
-                  or "pmos" in name
-              ):
-                  candidates.append(a)
-
-          candidates.sort(
-              key=lambda x: x["created_at"],
-              reverse=True
-          )
-
-          with open("kernel_candidates.txt", "w") as f:
-              for a in candidates:
-                  f.write(str(a["id"]) + "\n")
-
-          print("Kernel candidates:")
-          for a in candidates:
-              print(a["id"], a["name"])
+          print(open("mediatek-dt-analysis.txt").read())
           PY
 
-          FOUND=""
-
-          while read -r ID; do
-
-            echo
-            echo "=============================================="
-            echo "CHECKING ARTIFACT $ID"
-            echo "=============================================="
-
-            rm -rf kernel-artifact/current
-            mkdir -p kernel-artifact/current
-
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/${{ github.repository }}/actions/artifacts/${ID}/zip" \
-              > kernel-artifact/current.zip
-
-            unzip -oq \
-              kernel-artifact/current.zip \
-              -d kernel-artifact/current || true
-
-            find kernel-artifact/current \
-              -type f \
-              -printf '%p\n'
-
-            IMAGE=$(find kernel-artifact/current \
-              -type f \
-              \( \
-                -name "Image" \
-                -o -name "Image.gz" \
-              \) \
-              | head -n1)
-
-            DTB=$(find kernel-artifact/current \
-              -type f \
-              \( \
-                -name "dandelion.dtb" \
-                -o -name "mt6762g-xiaomi-dandelion.dtb" \
-              \) \
-              | head -n1)
-
-            if [ -n "$IMAGE" ] && [ -n "$DTB" ]; then
-
-              echo
-              echo "CORRECT ARTIFACT FOUND"
-              echo "Artifact ID: $ID"
-              echo "Kernel: $IMAGE"
-              echo "DTB: $DTB"
-
-              mkdir -p kernel-artifact/final
-
-              cp "$IMAGE" kernel-artifact/final/Image
-              cp "$DTB" kernel-artifact/final/dandelion.dtb
-
-              FOUND="yes"
-              break
-            fi
-
-          done < kernel_candidates.txt
-
-          if [ -z "$FOUND" ]; then
-            echo "ERROR: Kernel + DTB artifact not found"
-            exit 1
-          fi
-
-      # =========================================================
-      # 5. Extract stock boot DTB
-      # =========================================================
-      - name: Extract stock boot components
+      - name: Analyze stock DT region
         run: |
-          set -e
+          python3 <<'PY'
+          data = open("stock-boot.img", "rb").read()
 
-          rm -rf stock-unpacked
-          mkdir -p stock-unpacked
+          start = 0xD20000
+          end = min(len(data), 0xD50000)
 
-          git clone --depth=1 \
-            https://android.googlesource.com/platform/system/tools/mkbootimg \
-            tools-mkbootimg
+          with open("stock-dt-region.bin", "wb") as f:
+              f.write(data[start:end])
 
-          python3 tools-mkbootimg/unpack_bootimg.py \
-            --boot_img stock-boot.img \
-            --out stock-unpacked
+          with open("stock-dt-region-info.txt", "w") as f:
+              f.write("Stock DT region inspection\n")
+              f.write("==========================\n")
+              f.write(f"Start: 0x{start:X}\n")
+              f.write(f"End:   0x{end:X}\n")
+              f.write(f"Size:  {end-start} bytes\n")
+              f.write(f"First 64 bytes: {data[start:start+64].hex()}\n")
 
-          echo
-          echo "=============================================="
-          echo "STOCK BOOT CONTENTS"
-          echo "=============================================="
+          print(open("stock-dt-region-info.txt").read())
+          PY
 
-          find stock-unpacked \
-            -type f \
-            -exec ls -lh {} \;
-
-      # =========================================================
-      # 6. Locate stock DTB
-      # =========================================================
-      - name: Locate stock DTB
+      - name: Binwalk stock boot
         run: |
-          set -e
+          binwalk stock-boot.img > binwalk-stock-boot.txt || true
 
-          echo "=============================================="
-          echo "SEARCHING STOCK DTB"
-          echo "=============================================="
-
-          find stock-unpacked \
-            -type f \
-            -print
-
-          STOCK_DTB=$(find stock-unpacked \
-            -type f \
-            \( \
-              -name "*.dtb" \
-              -o -name "dtb" \
-              -o -name "dt.img" \
-            \) \
-            | head -n1)
-
-          if [ -z "$STOCK_DTB" ]; then
-            echo
-            echo "WARNING: unpack_boot_img did not expose DTB."
-            echo "Searching boot image with binwalk..."
-
-            binwalk stock-boot.img || true
-
-            exit 0
-          fi
-
-          cp "$STOCK_DTB" stock.dtb
-
-          echo
-          echo "Stock DTB:"
-          file stock.dtb
-          ls -lh stock.dtb
-
-      # =========================================================
-      # 7. Decompile both DTBs
-      # =========================================================
-      - name: Decompile device trees
+      - name: Hash everything
         run: |
-          set -e
+          sha256sum \
+            stock-boot.img \
+            stock-dt-region.bin \
+            boot-signature-scan.txt \
+            fdt-candidates.txt \
+            mediatek-dt-analysis.txt \
+            binwalk-stock-boot.txt \
+            > SHA256SUMS.txt
 
-          if [ ! -f stock.dtb ]; then
-            echo "Stock DTB unavailable; skipping DTB comparison."
-            exit 0
-          fi
+          cat SHA256SUMS.txt
 
-          mkdir -p dts
-
-          echo "Decompiling STOCK DTB..."
-
-          dtc \
-            -I dtb \
-            -O dts \
-            -o dts/stock.dts \
-            stock.dtb \
-            2> dts/stock-dtc-errors.txt || true
-
-          echo "Decompiling NEW Redmi 9A DTB..."
-
-          dtc \
-            -I dtb \
-            -O dts \
-            -o dts/dandelion.dts \
-            kernel-artifact/final/dandelion.dtb \
-            2> dts/dandelion-dtc-errors.txt || true
-
-          echo
-          echo "=============================================="
-          echo "DTS FILES"
-          echo "=============================================="
-
-          ls -lh dts/
-
-      # =========================================================
-      # 8. Check important hardware nodes
-      # =========================================================
-      - name: Compare important hardware nodes
+      - name: Package analysis
         run: |
-          set -e
+          mkdir -p Redmi9A-DT-Container-Analysis
 
-          mkdir -p report
+          cp stock-boot.img \
+             Redmi9A-DT-Container-Analysis/
 
-          {
-            echo "=============================================="
-            echo "REDMI 9A DEVICE TREE COMPATIBILITY REPORT"
-            echo "=============================================="
-            echo
+          cp stock-dt-region.bin \
+             Redmi9A-DT-Container-Analysis/
 
-            echo "DATE:"
-            date
-            echo
+          cp boot-signature-scan.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            echo "=============================================="
-            echo "NEW DTB INFORMATION"
-            echo "=============================================="
+          cp fdt-candidates.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            file kernel-artifact/final/dandelion.dtb
-            ls -lh kernel-artifact/final/dandelion.dtb
+          cp fdt-validation.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            echo
+          cp mediatek-dt-analysis.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            echo "=============================================="
-            echo "STOCK DTB INFORMATION"
-            echo "=============================================="
+          cp stock-dt-region-info.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            if [ -f stock.dtb ]; then
-              file stock.dtb
-              ls -lh stock.dtb
-            else
-              echo "Stock DTB unavailable"
-            fi
+          cp binwalk-stock-boot.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            echo
+          cp SHA256SUMS.txt \
+             Redmi9A-DT-Container-Analysis/
 
-            echo "=============================================="
-            echo "IMPORTANT NODE SEARCH"
-            echo "=============================================="
+          cp -r fdt-candidates \
+             Redmi9A-DT-Container-Analysis/ || true
 
-            for pattern in \
-              "compatible" \
-              "chosen" \
-              "memory" \
-              "uart" \
-              "serial" \
-              "mmc" \
-              "sdhci" \
-              "emmc" \
-              "gpio" \
-              "regulator" \
-              "clk" \
-              "clock" \
-              "watchdog" \
-              "usb" \
-              "mt6762" \
-              "mt6765" \
-              "dandelion"
-            do
+          zip -r \
+            Redmi9A-DT-Container-Analysis.zip \
+            Redmi9A-DT-Container-Analysis
 
-              echo
-              echo "----- $pattern -----"
-
-              if [ -f dts/stock.dts ]; then
-                echo "[STOCK]"
-                grep -in "$pattern" dts/stock.dts \
-                  | head -40 || true
-              fi
-
-              if [ -f dts/dandelion.dts ]; then
-                echo "[NEW]"
-                grep -in "$pattern" dts/dandelion.dts \
-                  | head -40 || true
-              fi
-
-            done
-
-          } | tee report/compatibility.txt
-
-      # =========================================================
-      # 9. Kernel information
-      # =========================================================
-      - name: Inspect kernel
-        run: |
-          set -e
-
-          {
-            echo "=============================================="
-            echo "KERNEL INFORMATION"
-            echo "=============================================="
-
-            file kernel-artifact/final/Image
-
-            ls -lh kernel-artifact/final/Image
-
-            echo
-            echo "SHA256:"
-            sha256sum kernel-artifact/final/Image
-
-            echo
-            echo "DTB SHA256:"
-            sha256sum kernel-artifact/final/dandelion.dtb
-
-            echo
-            echo "=============================================="
-            echo "KERNEL STRINGS"
-            echo "=============================================="
-
-            strings kernel-artifact/final/Image \
-              | grep -Ei \
-              "Linux version|mt6762|mt6765|dandelion|android" \
-              | head -50 || true
-
-          } | tee report/kernel.txt
-
-      # =========================================================
-      # 10. Stock boot information
-      # =========================================================
-      - name: Inspect stock boot header
-        run: |
-          set -e
-
-          {
-            echo "=============================================="
-            echo "STOCK BOOT IMAGE"
-            echo "=============================================="
-
-            file stock-boot.img
-
-            ls -lh stock-boot.img
-
-            echo
-            echo "SHA256:"
-            sha256sum stock-boot.img
-
-            echo
-            echo "=============================================="
-            echo "BINWALK"
-            echo "=============================================="
-
-            binwalk stock-boot.img || true
-
-            echo
-            echo "=============================================="
-            echo "BOOT CONFIG"
-            echo "=============================================="
-
-            if [ -f stock-unpacked/bootimg.cfg ]; then
-              cat stock-unpacked/bootimg.cfg
-            else
-              echo "No bootimg.cfg"
-            fi
-
-          } | tee report/stock-boot.txt
-
-      # =========================================================
-      # 11. Final safety confirmation
-      # =========================================================
-      - name: Safety confirmation
-        run: |
-          set -e
-
-          echo
-          echo "=============================================="
-          echo "SAFETY CONFIRMATION"
-          echo "=============================================="
-          echo
-          echo "NO DEVICE WAS FLASHED."
-          echo
-          echo "NO FASTBOOT COMMAND WAS USED."
-          echo
-          echo "NO PRELOADER WAS MODIFIED."
-          echo
-          echo "NO PARTITION WAS WRITTEN."
-          echo
-          echo "This workflow only analyzes kernel,"
-          echo "DTB and stock boot compatibility."
-          echo
-
-      # =========================================================
-      # 12. Upload complete report
-      # =========================================================
-      - name: Upload compatibility report
+      - name: Upload analysis artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-Dandelion-Compatibility-Report
-          path: |
-            report/
-            dts/
-            kernel-artifact/final/
-            stock.dtb
-            stock-unpacked/
-            stock-boot.img
-          if-no-files-found: warn
+          name: Redmi9A-DT-Container-Analysis
+          path: Redmi9A-DT-Container-Analysis.zip
+          retention-days: 14
