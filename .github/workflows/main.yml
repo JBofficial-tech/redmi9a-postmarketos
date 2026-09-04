@@ -1,10 +1,10 @@
-name: Redmi 9A Stock DT Container Scan
+name: Redmi 9A Dandelion DTB Deep Compare
 
 on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  compare:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,13 +16,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             device-tree-compiler \
-            binwalk \
+            unzip \
             file \
-            xxd \
-            gzip \
-            unzip
+            binutils
 
-      - name: Download stock boot artifact
+      - name: Download stock boot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -32,11 +30,6 @@ jobs:
             -n Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM \
             -D input
 
-          echo "=== Downloaded files ==="
-          find input -type f -maxdepth 3 -print
-
-      - name: Locate stock boot
-        run: |
           BOOT=$(find input -type f -name "*.img" | head -n 1)
 
           if [ -z "$BOOT" ]; then
@@ -46,310 +39,357 @@ jobs:
 
           cp "$BOOT" stock-boot.img
 
-          echo "Using:"
-          ls -lh stock-boot.img
-          file stock-boot.img
-
-      - name: Scan complete boot image for FDT signatures
+      - name: Download successful dandelion kernel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 <<'PY'
-          data = open("stock-boot.img", "rb").read()
+          mkdir -p kernel-artifact
 
-          signatures = {
-              b"\xd0\x0d\xfe\xed": "STANDARD_FDT",
-              b"\xd7\xb7\xab\x1e": "MEDIATEK_OR_VENDOR_DT"
-          }
+          echo "Searching recent successful workflow artifacts..."
 
-          with open("boot-signature-scan.txt", "w") as out:
-              out.write("Redmi 9A Stock Boot DT Signature Scan\n")
-              out.write("=" * 60 + "\n")
-              out.write(f"Boot size: {len(data)} bytes\n\n")
+          gh run list \
+            --limit 30 \
+            --json databaseId,status,conclusion,name \
+            > runs.json
 
-              for sig, name in signatures.items():
-                  offsets = []
-                  pos = 0
+          cat runs.json
 
-                  while True:
-                      pos = data.find(sig, pos)
+          # Try known successful artifact workflow/run if available
+          FOUND=""
 
-                      if pos == -1:
-                          break
+          for RUN in $(python3 - <<'PY'
+          import json
 
-                      offsets.append(pos)
-                      pos += 1
+          data=json.load(open("runs.json"))
 
-                  out.write(f"{name} {sig.hex()}\n")
-                  out.write(f"Count: {len(offsets)}\n")
-
-                  for off in offsets:
-                      out.write(
-                          f"  offset=0x{off:X} ({off})\n"
-                      )
-
-                  out.write("\n")
-
-          print(open("boot-signature-scan.txt").read())
+          for r in data:
+              if r.get("status") == "completed" and r.get("conclusion") == "success":
+                  print(r["databaseId"])
           PY
+          ); do
 
-      - name: Analyze possible FDT candidates
-        run: |
-          mkdir -p fdt-candidates
+            echo "Checking run: $RUN"
 
-          python3 <<'PY'
-          import struct
-          import os
+            if gh run download "$RUN" -D kernel-artifact 2>/dev/null; then
+              if find kernel-artifact -type f \( \
+                  -name "dandelion.dtb" \
+                  -o -name "mt6762g-xiaomi-dandelion.dtb" \
+                  \) | grep -q .; then
+                FOUND="$RUN"
+                break
+              fi
+            fi
 
-          data = open("stock-boot.img", "rb").read()
-          magic = b"\xd0\x0d\xfe\xed"
+            rm -rf kernel-artifact
+            mkdir -p kernel-artifact
+          done
 
-          candidates = []
-          pos = 0
-
-          while True:
-              pos = data.find(magic, pos)
-
-              if pos == -1:
-                  break
-
-              if pos + 40 <= len(data):
-                  try:
-                      (
-                          f_magic,
-                          totalsize,
-                          off_dt_struct,
-                          off_dt_strings,
-                          off_mem_rsvmap,
-                          version,
-                          last_comp_version,
-                          boot_cpuid_phys,
-                          size_dt_strings,
-                          size_dt_struct
-                      ) = struct.unpack_from(">10I", data, pos)
-
-                      valid = (
-                          totalsize >= 40 and
-                          totalsize <= len(data) - pos and
-                          off_dt_struct < totalsize and
-                          off_dt_strings < totalsize and
-                          version >= 1 and
-                          version <= 20
-                      )
-
-                      candidates.append({
-                          "offset": pos,
-                          "totalsize": totalsize,
-                          "off_dt_struct": off_dt_struct,
-                          "off_dt_strings": off_dt_strings,
-                          "off_mem_rsvmap": off_mem_rsvmap,
-                          "version": version,
-                          "last_comp_version": last_comp_version,
-                          "size_dt_strings": size_dt_strings,
-                          "size_dt_struct": size_dt_struct,
-                          "valid": valid
-                      })
-
-                      if valid:
-                          name = f"candidate_{pos:08X}.dtb"
-                          with open(
-                              os.path.join("fdt-candidates", name),
-                              "wb"
-                          ) as f:
-                              f.write(data[pos:pos + totalsize])
-
-                  except Exception as e:
-                      print("Parse error at", hex(pos), e)
-
-              pos += 1
-
-          with open("fdt-candidates.txt", "w") as out:
-              out.write("Standard FDT Candidate Analysis\n")
-              out.write("=" * 70 + "\n\n")
-
-              if not candidates:
-                  out.write("NO d00dfeed signatures found.\n")
-              else:
-                  for c in candidates:
-                      out.write(
-                          f"Offset: 0x{c['offset']:X}\n"
-                          f"Total size: {c['totalsize']}\n"
-                          f"Version: {c['version']}\n"
-                          f"Last compatible version: {c['last_comp_version']}\n"
-                          f"Structure offset: 0x{c['off_dt_struct']:X}\n"
-                          f"Strings offset: 0x{c['off_dt_strings']:X}\n"
-                          f"Structure size: {c['size_dt_struct']}\n"
-                          f"Strings size: {c['size_dt_strings']}\n"
-                          f"VALID: {c['valid']}\n"
-                          + "-" * 70 + "\n"
-                      )
-
-          print(open("fdt-candidates.txt").read())
-          PY
-
-      - name: Validate extracted FDT candidates
-        run: |
-          {
-            echo "FDT validation"
-            echo "=============="
-          } > fdt-validation.txt
-
-          shopt -s nullglob
-
-          files=(fdt-candidates/*.dtb)
-
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No valid FDT candidates extracted." | tee -a fdt-validation.txt
-          else
-            for dtb in "${files[@]}"; do
-              echo "" | tee -a fdt-validation.txt
-              echo "FILE: $dtb" | tee -a fdt-validation.txt
-
-              dtc -I dtb -O dts "$dtb" \
-                -o "${dtb%.dtb}.dts" \
-                2>&1 | tee -a fdt-validation.txt || true
-            done
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: Could not automatically find dandelion DTB artifact."
+            echo "Please ensure the previous successful dandelion DTB build artifact exists."
+            exit 1
           fi
 
-      - name: Inspect MediaTek/vendor DT magic
+          echo "Found DTB from run: $FOUND"
+
+          find kernel-artifact -type f -print
+
+      - name: Locate dandelion DTB
+        run: |
+          DTB=$(find kernel-artifact -type f \
+            \( -name "dandelion.dtb" \
+            -o -name "mt6762g-xiaomi-dandelion.dtb" \
+            \) | head -n 1)
+
+          if [ -z "$DTB" ]; then
+            echo "ERROR: dandelion DTB not found"
+            exit 1
+          fi
+
+          cp "$DTB" dandelion.dtb
+
+          echo "Dandelion DTB:"
+          ls -lh dandelion.dtb
+          file dandelion.dtb
+
+      - name: Extract stock wrapped DTB
         run: |
           python3 <<'PY'
           import struct
 
-          data = open("stock-boot.img", "rb").read()
+          boot = open("stock-boot.img", "rb").read()
+
           magic = b"\xd7\xb7\xab\x1e"
+          pos = boot.find(magic)
 
-          with open("mediatek-dt-analysis.txt", "w") as out:
-              out.write("MediaTek/Vendor DT Signature Analysis\n")
-              out.write("=" * 70 + "\n")
+          if pos < 0:
+              raise SystemExit("Vendor DT header not found")
 
-              pos = 0
-              count = 0
+          print(f"Vendor DT header: 0x{pos:X}")
 
-              while True:
-                  pos = data.find(magic, pos)
+          # MediaTek/vendor header:
+          # +0x00 magic
+          # +0x04 total container size
+          # +0x08 header size
+          # +0x0C payload offset
+          # +0x20 payload size
+          # +0x24 payload alignment
 
-                  if pos == -1:
-                      break
+          total_size = struct.unpack_from(">I", boot, pos + 4)[0]
+          header_size = struct.unpack_from(">I", boot, pos + 8)[0]
+          payload_offset = struct.unpack_from(">I", boot, pos + 12)[0]
+          payload_size = struct.unpack_from(">I", boot, pos + 0x20)[0]
 
-                  count += 1
+          print(f"Total size:    {total_size}")
+          print(f"Header size:   {header_size}")
+          print(f"Payload offset:{payload_offset}")
+          print(f"Payload size:  {payload_size}")
 
-                  out.write(f"\nOccurrence #{count}\n")
-                  out.write(f"Offset: 0x{pos:X} ({pos})\n")
+          dtb_start = pos + payload_offset
+          dtb_end = dtb_start + payload_size
 
-                  chunk = data[pos:pos + 128]
+          if dtb_end > len(boot):
+              raise SystemExit("DTB extends outside boot image")
 
-                  out.write("Hex dump:\n")
+          dtb = boot[dtb_start:dtb_end]
 
-                  for i in range(0, len(chunk), 16):
-                      row = chunk[i:i+16]
-                      out.write(
-                          f"{pos+i:08X}: "
-                          + " ".join(f"{b:02X}" for b in row)
-                          + "\n"
-                      )
-
-                  if pos + 64 <= len(data):
-                      words = struct.unpack_from(
-                          ">16I",
-                          data,
-                          pos
-                      )
-
-                      out.write("\nBig-endian 32-bit words:\n")
-
-                      for i, word in enumerate(words):
-                          out.write(
-                              f"+0x{i*4:02X}: 0x{word:08X} ({word})\n"
-                          )
-
-                  pos += 1
-
-              out.write(
-                  f"\nTotal {magic.hex()} occurrences: {count}\n"
+          if dtb[:4] != b"\xd0\x0d\xfe\xed":
+              raise SystemExit(
+                  "Extracted payload is not a standard FDT"
               )
 
-          print(open("mediatek-dt-analysis.txt").read())
+          open("stock-dandelion.dtb", "wb").write(dtb)
+
+          print(
+              f"Extracted stock DTB: "
+              f"0x{dtb_start:X}-0x{dtb_end:X}"
+          )
           PY
 
-      - name: Analyze stock DT region
+          ls -lh stock-dandelion.dtb
+
+      - name: Convert both DTBs to DTS
+        run: |
+          dtc -I dtb -O dts \
+            stock-dandelion.dtb \
+            -o stock-dandelion.dts \
+            2> stock-dtc-warnings.txt || true
+
+          dtc -I dtb -O dts \
+            dandelion.dtb \
+            -o dandelion.dts \
+            2> dandelion-dtc-warnings.txt || true
+
+      - name: Generate DTB header information
         run: |
           python3 <<'PY'
-          data = open("stock-boot.img", "rb").read()
+          import struct
 
-          start = 0xD20000
-          end = min(len(data), 0xD50000)
+          def info(path):
+              data=open(path,"rb").read()
 
-          with open("stock-dt-region.bin", "wb") as f:
-              f.write(data[start:end])
+              vals=struct.unpack(">10I",data[:40])
 
-          with open("stock-dt-region-info.txt", "w") as f:
-              f.write("Stock DT region inspection\n")
-              f.write("==========================\n")
-              f.write(f"Start: 0x{start:X}\n")
-              f.write(f"End:   0x{end:X}\n")
-              f.write(f"Size:  {end-start} bytes\n")
-              f.write(f"First 64 bytes: {data[start:start+64].hex()}\n")
+              return {
+                  "file": path,
+                  "size": len(data),
+                  "magic": hex(vals[0]),
+                  "totalsize": vals[1],
+                  "off_dt_struct": hex(vals[2]),
+                  "off_dt_strings": hex(vals[3]),
+                  "off_mem_rsvmap": hex(vals[4]),
+                  "version": vals[5],
+                  "last_comp_version": vals[6],
+                  "boot_cpuid_phys": vals[7],
+                  "size_dt_strings": vals[8],
+                  "size_dt_struct": vals[9],
+              }
 
-          print(open("stock-dt-region-info.txt").read())
+          with open("dtb-header-comparison.txt","w") as f:
+              for path in ["stock-dandelion.dtb","dandelion.dtb"]:
+                  f.write("="*70+"\n")
+                  for k,v in info(path).items():
+                      f.write(f"{k}: {v}\n")
+                  f.write("\n")
           PY
 
-      - name: Binwalk stock boot
-        run: |
-          binwalk stock-boot.img > binwalk-stock-boot.txt || true
+          cat dtb-header-comparison.txt
 
-      - name: Hash everything
+      - name: Extract important DT properties
+        run: |
+          python3 <<'PY'
+          import re
+
+          files = {
+              "STOCK": "stock-dandelion.dts",
+              "MAINLINE": "dandelion.dts"
+          }
+
+          patterns = [
+              r'model\s*=\s*"[^"]*"',
+              r'compatible\s*=\s*[^;]+;',
+              r'bootargs\s*=\s*"[^"]*"',
+              r'linux,initrd-start[^;]*;',
+              r'linux,initrd-end[^;]*;',
+              r'memory@[^ ]*',
+              r'ramoops@[^ ]*',
+              r'chosen\s*\{',
+              r'cpus\s*\{',
+              r'cpu@[^ ]*',
+              r'firmware-name\s*=\s*"[^"]*"',
+          ]
+
+          with open("important-dt-properties.txt","w") as out:
+
+              for name,path in files.items():
+
+                  out.write("\n")
+                  out.write("#"*70+"\n")
+                  out.write(name+"\n")
+                  out.write("#"*70+"\n")
+
+                  text=open(path,errors="replace").read()
+
+                  for pattern in patterns:
+
+                      out.write(f"\nPATTERN: {pattern}\n")
+
+                      matches=re.findall(pattern,text)
+
+                      for m in matches[:100]:
+                          out.write(str(m)+"\n")
+          PY
+
+          cat important-dt-properties.txt
+
+      - name: Compare DT node names
+        run: |
+          python3 <<'PY'
+          import re
+
+          def nodes(path):
+              text=open(path,errors="replace").read()
+
+              result=set()
+
+              for line in text.splitlines():
+                  line=line.strip()
+
+                  if line.endswith("{"):
+                      name=line[:-1].strip()
+
+                      if name and not name.startswith(("/","//")):
+                          result.add(name)
+
+              return result
+
+          stock=nodes("stock-dandelion.dts")
+          mainline=nodes("dandelion.dts")
+
+          only_stock=sorted(stock-mainline)
+          only_mainline=sorted(mainline-stock)
+          common=sorted(stock&mainline)
+
+          with open("dt-node-comparison.txt","w") as f:
+
+              f.write("STOCK ONLY\n")
+              f.write("="*70+"\n")
+
+              for x in only_stock:
+                  f.write(x+"\n")
+
+              f.write("\nMAINLINE ONLY\n")
+              f.write("="*70+"\n")
+
+              for x in only_mainline:
+                  f.write(x+"\n")
+
+              f.write("\nCOMMON\n")
+              f.write("="*70+"\n")
+
+              for x in common:
+                  f.write(x+"\n")
+
+              f.write("\nSUMMARY\n")
+              f.write("="*70+"\n")
+              f.write(f"Stock nodes: {len(stock)}\n")
+              f.write(f"Mainline nodes: {len(mainline)}\n")
+              f.write(f"Common nodes: {len(common)}\n")
+              f.write(f"Stock only: {len(only_stock)}\n")
+              f.write(f"Mainline only: {len(only_mainline)}\n")
+          PY
+
+          cat dt-node-comparison.txt
+
+      - name: Search Redmi 9A identity
+        run: |
+          {
+            echo "STOCK:"
+            grep -inE \
+              'dandelion|mt6762|mt6765|xiaomi' \
+              stock-dandelion.dts | head -100 || true
+
+            echo
+            echo "MAINLINE:"
+            grep -inE \
+              'dandelion|mt6762|mt6765|xiaomi' \
+              dandelion.dts | head -100 || true
+          } > device-identity.txt
+
+          cat device-identity.txt
+
+      - name: SHA256
         run: |
           sha256sum \
             stock-boot.img \
-            stock-dt-region.bin \
-            boot-signature-scan.txt \
-            fdt-candidates.txt \
-            mediatek-dt-analysis.txt \
-            binwalk-stock-boot.txt \
+            stock-dandelion.dtb \
+            dandelion.dtb \
             > SHA256SUMS.txt
 
-          cat SHA256SUMS.txt
-
-      - name: Package analysis
+      - name: Package final report
         run: |
-          mkdir -p Redmi9A-DT-Container-Analysis
+          mkdir -p Redmi9A-DTB-Deep-Compare
 
-          cp stock-boot.img \
-             Redmi9A-DT-Container-Analysis/
+          cp stock-dandelion.dtb \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp stock-dt-region.bin \
-             Redmi9A-DT-Container-Analysis/
+          cp dandelion.dtb \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp boot-signature-scan.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp stock-dandelion.dts \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp fdt-candidates.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp dandelion.dts \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp fdt-validation.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp stock-dtc-warnings.txt \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp mediatek-dt-analysis.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp dandelion-dtc-warnings.txt \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp stock-dt-region-info.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp dtb-header-comparison.txt \
+            Redmi9A-DTB-Deep-Compare/
 
-          cp binwalk-stock-boot.txt \
-             Redmi9A-DT-Container-Analysis/
+          cp important-dt-properties.txt \
+            Redmi9A-DTB-Deep-Compare/
+
+          cp dt-node-comparison.txt \
+            Redmi9A-DTB-Deep-Compare/
+
+          cp device-identity.txt \
+            Redmi9A-DTB-Deep-Compare/
 
           cp SHA256SUMS.txt \
-             Redmi9A-DT-Container-Analysis/
-
-          cp -r fdt-candidates \
-             Redmi9A-DT-Container-Analysis/ || true
+            Redmi9A-DTB-Deep-Compare/
 
           zip -r \
-            Redmi9A-DT-Container-Analysis.zip \
-            Redmi9A-DT-Container-Analysis
+            Redmi9A-DTB-Deep-Compare.zip \
+            Redmi9A-DTB-Deep-Compare
 
-      - name: Upload analysis artifact
+      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-DT-Container-Analysis
-          path: Redmi9A-DT-Container-Analysis.zip
+          name: Redmi9A-DTB-Deep-Compare
+          path: Redmi9A-DTB-Deep-Compare.zip
           retention-days: 14
