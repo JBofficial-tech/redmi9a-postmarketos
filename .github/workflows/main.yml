@@ -1,66 +1,34 @@
-name: Redmi 9A DTB Deep Comparison
+name: Redmi 9A DT Deep Analysis
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
-  compare:
+  analyze:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install analysis tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             device-tree-compiler \
             python3 \
             file \
-            binutils
+            binutils \
+            xxd
 
-      # --------------------------------------------------
-      # Download previously successful mainline kernel artifact
-      # --------------------------------------------------
-      - name: Download mainline dandelion DTB
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p mainline
+      # ==================================================
+      # DOWNLOAD STOCK DT EXTRACTION
+      # ==================================================
 
-          gh run download 33749861009 \
-            -D mainline \
-            || true
-
-          echo "=== DOWNLOADED FILES ==="
-          find mainline -type f -maxdepth 5 -print
-
-      # --------------------------------------------------
-      # Locate dandelion.dtb from artifact
-      # --------------------------------------------------
-      - name: Locate mainline DTB
-        run: |
-          DTB=$(find mainline \
-            -type f \
-            \( -name "dandelion.dtb" \
-            -o -name "mt6762g-xiaomi-dandelion.dtb" \) \
-            | head -n 1)
-
-          if [ -z "$DTB" ]; then
-            echo "ERROR: mainline dandelion DTB not found"
-            exit 1
-          fi
-
-          cp "$DTB" mainline-dandelion.dtb
-
-          echo "Mainline DTB:"
-          file mainline-dandelion.dtb
-          ls -lh mainline-dandelion.dtb
-
-      # --------------------------------------------------
-      # Download stock DT extraction artifact
-      # --------------------------------------------------
       - name: Download stock DT extraction
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,14 +36,12 @@ jobs:
           mkdir -p stock
 
           gh run download 33856392991 \
+            -n Redmi9A-Stock-DT-Extracted \
             -D stock
 
-          echo "=== STOCK ARTIFACT ==="
-          find stock -type f -maxdepth 6 -print
+          echo "=== STOCK ARTIFACT FILES ==="
+          find stock -type f -print
 
-      # --------------------------------------------------
-      # Locate stock DTS
-      # --------------------------------------------------
       - name: Locate stock DTS
         run: |
           STOCK_DTS=$(find stock \
@@ -88,88 +54,292 @@ jobs:
             exit 1
           fi
 
-          cp "$STOCK_DTS" stock-dandelion.dts
+          cp "$STOCK_DTS" stock.dts
 
-          echo "Stock DTS:"
-          ls -lh stock-dandelion.dts
+          echo "=== STOCK DTS ==="
+          ls -lh stock.dts
 
-      # --------------------------------------------------
-      # Decompile mainline DTB
-      # --------------------------------------------------
+      - name: Locate stock DTB
+        run: |
+          STOCK_DTB=$(find stock \
+            -type f \
+            -name "stock-dandelion.dtb" \
+            | head -n 1)
+
+          if [ -z "$STOCK_DTB" ]; then
+            STOCK_DTB=$(find stock \
+              -type f \
+              -name "*.dtb" \
+              | head -n 1)
+          fi
+
+          if [ -z "$STOCK_DTB" ]; then
+            echo "ERROR: stock DTB not found"
+            exit 1
+          fi
+
+          cp "$STOCK_DTB" stock.dtb
+
+          echo "=== STOCK DTB ==="
+          file stock.dtb
+          ls -lh stock.dtb
+
+      # ==================================================
+      # FIND MAINLINE ARTIFACT AUTOMATICALLY
+      # ==================================================
+
+      - name: Find mainline DTB artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== AVAILABLE NON-EXPIRED ARTIFACTS ==="
+
+          gh api \
+            --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[]
+              | select(.expired == false)
+              | [.id, .name, .created_at]
+              | @tsv' \
+            | tee artifacts-list.txt
+
+          echo
+          echo "=== SEARCHING FOR MAINLINE ARTIFACT ==="
+
+          ARTIFACT_ID=$(
+            gh api \
+              --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq '.artifacts[]
+                | select(.expired == false)
+                | select(
+                    .name == "Redmi9A-pmOS-Package-Analysis"
+                    or
+                    (.name | ascii_downcase | contains("dandelion"))
+                    or
+                    (.name | ascii_downcase | contains("kernel-dtb"))
+                  )
+                | [.id, .name, .created_at]
+                | @tsv' \
+              | head -n 1 \
+              | cut -f1
+          )
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ERROR: Could not find mainline DTB artifact"
+            echo
+            echo "Available artifacts:"
+            cat artifacts-list.txt
+            exit 1
+          fi
+
+          echo "Selected artifact ID:"
+          echo "$ARTIFACT_ID"
+
+          echo "$ARTIFACT_ID" > mainline-artifact-id.txt
+
+      # ==================================================
+      # DOWNLOAD MAINLINE ARTIFACT
+      # ==================================================
+
+      - name: Download mainline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p mainline
+
+          ARTIFACT_ID=$(cat mainline-artifact-id.txt)
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > mainline-artifact.zip
+
+          unzip -q mainline-artifact.zip \
+            -d mainline
+
+          echo "=== MAINLINE ARTIFACT CONTENT ==="
+          find mainline -type f -print
+
+      # ==================================================
+      # LOCATE MAINLINE DTB
+      # ==================================================
+
+      - name: Locate mainline dandelion DTB
+        run: |
+          echo "=== SEARCHING FOR DTB ==="
+
+          find mainline \
+            -type f \
+            \( \
+              -name "dandelion.dtb" \
+              -o \
+              -name "mt6762g-xiaomi-dandelion.dtb" \
+            \) \
+            -print
+
+          MAINLINE_DTB=$(
+            find mainline \
+              -type f \
+              \( \
+                -name "dandelion.dtb" \
+                -o \
+                -name "mt6762g-xiaomi-dandelion.dtb" \
+              \) \
+              | head -n 1
+          )
+
+          if [ -z "$MAINLINE_DTB" ]; then
+            echo "ERROR: Mainline dandelion DTB not found"
+            echo
+            echo "All DTB files found:"
+            find mainline -type f -name "*.dtb" -print
+            exit 1
+          fi
+
+          cp "$MAINLINE_DTB" mainline.dtb
+
+          echo "=== MAINLINE DTB ==="
+          file mainline.dtb
+          ls -lh mainline.dtb
+
+      # ==================================================
+      # DECOMPILE MAINLINE DTB
+      # ==================================================
+
       - name: Decompile mainline DTB
         run: |
           dtc \
             -I dtb \
             -O dts \
-            mainline-dandelion.dtb \
-            -o mainline-dandelion.dts \
+            mainline.dtb \
+            -o mainline.dts \
             2>&1 | tee mainline-dtc.log || true
 
-          if [ ! -s mainline-dandelion.dts ]; then
-            echo "ERROR: Failed to generate mainline DTS"
+          if [ ! -s mainline.dts ]; then
+            echo "ERROR: mainline DTS generation failed"
             exit 1
           fi
 
-          echo "=== MAINLINE DTS ==="
-          ls -lh mainline-dandelion.dts
+          echo "Mainline DTS generated successfully"
 
-      # --------------------------------------------------
-      # Basic DT information
-      # --------------------------------------------------
+      # ==================================================
+      # DTB HEADER INFORMATION
+      # ==================================================
+
+      - name: Inspect DTB headers
+        run: |
+          python3 <<'PY'
+          import struct
+
+          def inspect(path):
+              data = open(path, "rb").read()
+
+              print()
+              print("=" * 60)
+              print(path)
+              print("=" * 60)
+
+              if len(data) < 40:
+                  print("Too small for FDT header")
+                  return
+
+              vals = struct.unpack_from(">10I", data, 0)
+
+              (
+                  magic,
+                  totalsize,
+                  off_struct,
+                  off_strings,
+                  off_rsvmap,
+                  version,
+                  last_version,
+                  boot_cpu,
+                  size_strings,
+                  size_struct
+              ) = vals
+
+              print(f"Magic            : 0x{magic:08X}")
+              print(f"Total size       : {totalsize}")
+              print(f"Structure offset : 0x{off_struct:X}")
+              print(f"Strings offset   : 0x{off_strings:X}")
+              print(f"Reserve map      : 0x{off_rsvmap:X}")
+              print(f"Version          : {version}")
+              print(f"Last version     : {last_version}")
+              print(f"Boot CPU         : {boot_cpu}")
+              print(f"Strings size     : {size_strings}")
+              print(f"Structure size   : {size_struct}")
+
+          inspect("stock.dtb")
+          inspect("mainline.dtb")
+          PY
+
+      # ==================================================
+      # OVERVIEW
+      # ==================================================
+
       - name: Generate DT overview
         run: |
           {
             echo "=========================================="
             echo "REDMI 9A DEVICE TREE OVERVIEW"
             echo "=========================================="
-            echo
-
-            echo "=== STOCK DTB ==="
-            grep -inE \
-              'model =|compatible =|bootargs|#address-cells|#size-cells' \
-              stock-dandelion.dts \
-              | head -100 || true
 
             echo
-            echo "=== MAINLINE DTS ==="
+            echo "=== STOCK ==="
+
             grep -inE \
-              'model =|compatible =|bootargs|#address-cells|#size-cells' \
-              mainline-dandelion.dts \
-              | head -100 || true
+              'model =|compatible =|bootargs|memory@|cpu@|mt6765|dandelion|xiaomi' \
+              stock.dts \
+              | head -250 || true
+
+            echo
+            echo "=== MAINLINE ==="
+
+            grep -inE \
+              'model =|compatible =|bootargs|memory@|cpu@|mt6762|mt6765|dandelion|xiaomi' \
+              mainline.dts \
+              | head -250 || true
 
           } | tee dt-overview.txt
 
-      # --------------------------------------------------
-      # Extract node names
-      # --------------------------------------------------
-      - name: Extract node lists
+      # ==================================================
+      # NODE EXTRACTION
+      # ==================================================
+
+      - name: Extract DT node names
         run: |
           python3 <<'PY'
           import re
 
-          def extract_nodes(path):
-              text = open(path, errors="ignore").read()
+          def nodes(path):
+              result = set()
 
-              nodes = set()
-
-              for line in text.splitlines():
+              for line in open(path, errors="ignore"):
                   line = line.strip()
 
                   if not line or line.startswith("//"):
                       continue
 
-                  # Remove labels before node declaration
-                  line = re.sub(r'^[A-Za-z0-9_]+:\s*', '', line)
+                  # Remove labels
+                  line = re.sub(
+                      r'^[A-Za-z0-9_]+:\s*',
+                      '',
+                      line
+                  )
 
-                  m = re.match(r'([A-Za-z0-9,._+\-]+(?:@[0-9a-fA-Fx]+)?)\s*\{', line)
+                  m = re.match(
+                      r'([A-Za-z0-9_.,+@\-]+)\s*\{',
+                      line
+                  )
 
                   if m:
-                      nodes.add(m.group(1))
+                      result.add(m.group(1))
 
-              return sorted(nodes)
+              return sorted(result)
 
-          stock = extract_nodes("stock-dandelion.dts")
-          mainline = extract_nodes("mainline-dandelion.dts")
+          stock = nodes("stock.dts")
+          mainline = nodes("mainline.dts")
 
           open("stock-nodes.txt", "w").write(
               "\n".join(stock) + "\n"
@@ -179,14 +349,15 @@ jobs:
               "\n".join(mainline) + "\n"
           )
 
-          print("Stock nodes:", len(stock))
-          print("Mainline nodes:", len(mainline))
+          print("Stock node count:", len(stock))
+          print("Mainline node count:", len(mainline))
           PY
 
-      # --------------------------------------------------
-      # Compare node names
-      # --------------------------------------------------
-      - name: Compare node names
+      # ==================================================
+      # NODE DIFFERENCES
+      # ==================================================
+
+      - name: Compare DT nodes
         run: |
           comm -23 \
             <(sort stock-nodes.txt) \
@@ -198,24 +369,55 @@ jobs:
             <(sort mainline-nodes.txt) \
             > mainline-only-nodes.txt || true
 
-          echo "=== STOCK ONLY NODES ==="
+          echo "=== STOCK ONLY ==="
           cat stock-only-nodes.txt
 
           echo
-          echo "=== MAINLINE ONLY NODES ==="
+          echo "=== MAINLINE ONLY ==="
           cat mainline-only-nodes.txt
 
-      # --------------------------------------------------
-      # Search important hardware
-      # --------------------------------------------------
+      # ==================================================
+      # COMPATIBLE STRINGS
+      # ==================================================
+
+      - name: Compare compatible strings
+        run: |
+          grep -oE \
+            'compatible = "[^"]+"' \
+            stock.dts \
+            | sort -u \
+            > stock-compatible.txt
+
+          grep -oE \
+            'compatible = "[^"]+"' \
+            mainline.dts \
+            | sort -u \
+            > mainline-compatible.txt
+
+          comm -23 \
+            stock-compatible.txt \
+            mainline-compatible.txt \
+            > stock-only-compatible.txt || true
+
+          comm -13 \
+            stock-compatible.txt \
+            mainline-compatible.txt \
+            > mainline-only-compatible.txt || true
+
+          echo "=== STOCK ONLY COMPATIBLES ==="
+          cat stock-only-compatible.txt
+
+          echo
+          echo "=== MAINLINE ONLY COMPATIBLES ==="
+          cat mainline-only-compatible.txt
+
+      # ==================================================
+      # IMPORTANT HARDWARE
+      # ==================================================
+
       - name: Compare important hardware
         run: |
           {
-            echo "=========================================="
-            echo "IMPORTANT HARDWARE COMPARISON"
-            echo "=========================================="
-            echo
-
             for pattern in \
               'uart' \
               'serial' \
@@ -240,8 +442,8 @@ jobs:
               'pmic' \
               'mt6357' \
               'regulator' \
-              'clk' \
               'clock' \
+              'clk' \
               'watchdog' \
               'wdt' \
               'thermal' \
@@ -250,7 +452,6 @@ jobs:
               'wifi' \
               'wlan' \
               'bluetooth' \
-              'bt' \
               'camera' \
               'sensor' \
               'reserved-memory' \
@@ -265,174 +466,158 @@ jobs:
 
               echo "--- STOCK ---"
               grep -inE "$pattern" \
-                stock-dandelion.dts \
-                | head -80 || true
+                stock.dts \
+                | head -100 || true
 
               echo "--- MAINLINE ---"
               grep -inE "$pattern" \
-                mainline-dandelion.dts \
-                | head -80 || true
+                mainline.dts \
+                | head -100 || true
 
             done
 
           } | tee important-hardware.txt
 
-      # --------------------------------------------------
-      # Compare compatible strings
-      # --------------------------------------------------
-      - name: Compare compatible strings
-        run: |
-          grep -oE \
-            'compatible = "[^"]+"' \
-            stock-dandelion.dts \
-            | sort -u \
-            > stock-compatible.txt
+      # ==================================================
+      # FULL DIFF
+      # ==================================================
 
-          grep -oE \
-            'compatible = "[^"]+"' \
-            mainline-dandelion.dts \
-            | sort -u \
-            > mainline-compatible.txt
-
-          comm -23 \
-            <(sort stock-compatible.txt) \
-            <(sort mainline-compatible.txt) \
-            > stock-only-compatible.txt || true
-
-          comm -13 \
-            <(sort stock-compatible.txt) \
-            <(sort mainline-compatible.txt) \
-            > mainline-only-compatible.txt || true
-
-          echo "=== STOCK ONLY COMPATIBLES ==="
-          cat stock-only-compatible.txt
-
-          echo
-          echo "=== MAINLINE ONLY COMPATIBLES ==="
-          cat mainline-only-compatible.txt
-
-      # --------------------------------------------------
-      # Compare node properties for important areas
-      # --------------------------------------------------
-      - name: Generate focused DT report
-        run: |
-          {
-            echo "=========================================="
-            echo "REDMI 9A DT DEEP ANALYSIS"
-            echo "=========================================="
-            echo
-
-            echo "=== STOCK FILE ==="
-            wc -l stock-dandelion.dts
-            wc -c stock-dandelion.dts
-
-            echo
-            echo "=== MAINLINE FILE ==="
-            wc -l mainline-dandelion.dts
-            wc -c mainline-dandelion.dts
-
-            echo
-            echo "=== STOCK NODE COUNT ==="
-            wc -l stock-nodes.txt
-
-            echo
-            echo "=== MAINLINE NODE COUNT ==="
-            wc -l mainline-nodes.txt
-
-            echo
-            echo "=== STOCK-ONLY NODE COUNT ==="
-            wc -l stock-only-nodes.txt
-
-            echo
-            echo "=== MAINLINE-ONLY NODE COUNT ==="
-            wc -l mainline-only-nodes.txt
-
-            echo
-            echo "=== STOCK-ONLY COMPATIBLE COUNT ==="
-            wc -l stock-only-compatible.txt
-
-            echo
-            echo "=== MAINLINE-ONLY COMPATIBLE COUNT ==="
-            wc -l mainline-only-compatible.txt
-
-          } | tee dt-summary.txt
-
-      # --------------------------------------------------
-      # Create unified textual diff
-      # --------------------------------------------------
-      - name: Create DTS diff
+      - name: Generate DTS diff
         run: |
           diff -u \
-            stock-dandelion.dts \
-            mainline-dandelion.dts \
+            stock.dts \
+            mainline.dts \
             > stock-vs-mainline.diff \
             || true
 
-          echo "Diff generated:"
-          ls -lh stock-vs-mainline.diff
+          echo "DTS diff generated:"
+          wc -l stock-vs-mainline.diff
 
-      # --------------------------------------------------
-      # Package analysis
-      # --------------------------------------------------
-      - name: Create comparison package
+      # ==================================================
+      # SUMMARY
+      # ==================================================
+
+      - name: Generate summary
         run: |
-          mkdir -p Redmi9A-DT-Comparison
+          {
+            echo "=========================================="
+            echo "REDMI 9A DT ANALYSIS SUMMARY"
+            echo "=========================================="
 
-          cp stock-dandelion.dts \
-            Redmi9A-DT-Comparison/
+            echo
+            echo "=== FILE SIZES ==="
 
-          cp mainline-dandelion.dtb \
-            Redmi9A-DT-Comparison/
+            ls -lh \
+              stock.dtb \
+              mainline.dtb \
+              stock.dts \
+              mainline.dts
 
-          cp mainline-dandelion.dts \
-            Redmi9A-DT-Comparison/
+            echo
+            echo "=== NODE COUNTS ==="
+
+            printf "Stock nodes: "
+            wc -l < stock-nodes.txt
+
+            printf "Mainline nodes: "
+            wc -l < mainline-nodes.txt
+
+            printf "Stock-only nodes: "
+            wc -l < stock-only-nodes.txt
+
+            printf "Mainline-only nodes: "
+            wc -l < mainline-only-nodes.txt
+
+            echo
+            echo "=== COMPATIBLE COUNTS ==="
+
+            printf "Stock compatibles: "
+            wc -l < stock-compatible.txt
+
+            printf "Mainline compatibles: "
+            wc -l < mainline-compatible.txt
+
+            printf "Stock-only compatibles: "
+            wc -l < stock-only-compatible.txt
+
+            printf "Mainline-only compatibles: "
+            wc -l < mainline-only-compatible.txt
+
+          } | tee dt-summary.txt
+
+      # ==================================================
+      # PACKAGE EVERYTHING
+      # ==================================================
+
+      - name: Create analysis package
+        run: |
+          mkdir -p Redmi9A-DT-Deep-Analysis
+
+          cp stock.dtb \
+            Redmi9A-DT-Deep-Analysis/
+
+          cp mainline.dtb \
+            Redmi9A-DT-Deep-Analysis/
+
+          cp stock.dts \
+            Redmi9A-DT-Deep-Analysis/
+
+          cp mainline.dts \
+            Redmi9A-DT-Deep-Analysis/
 
           cp mainline-dtc.log \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp dt-overview.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp stock-nodes.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp mainline-nodes.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp stock-only-nodes.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp mainline-only-nodes.txt \
-            Redmi9A-DT-Comparison/
-
-          cp important-hardware.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp stock-compatible.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp mainline-compatible.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp stock-only-compatible.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
           cp mainline-only-compatible.txt \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
 
-          cp dt-summary.txt \
-            Redmi9A-DT-Comparison/
+          cp important-hardware.txt \
+            Redmi9A-DT-Deep-Analysis/
 
           cp stock-vs-mainline.diff \
-            Redmi9A-DT-Comparison/
+            Redmi9A-DT-Deep-Analysis/
+
+          cp dt-summary.txt \
+            Redmi9A-DT-Deep-Analysis/
+
+          cp artifacts-list.txt \
+            Redmi9A-DT-Deep-Analysis/
 
           zip -r \
-            Redmi9A-DT-Comparison.zip \
-            Redmi9A-DT-Comparison
+            Redmi9A-DT-Deep-Analysis.zip \
+            Redmi9A-DT-Deep-Analysis
 
-      - name: Upload comparison report
+      # ==================================================
+      # UPLOAD
+      # ==================================================
+
+      - name: Upload analysis
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-DT-Comparison
-          path: Redmi9A-DT-Comparison.zip
+          name: Redmi9A-DT-Deep-Analysis
+          path: Redmi9A-DT-Deep-Analysis.zip
           retention-days: 14
