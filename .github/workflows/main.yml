@@ -1,10 +1,10 @@
-name: Redmi 9A Stock DT Corrected Extraction
+name: Redmi 9A DTB Deep Comparison
 
 on:
   workflow_dispatch:
 
 jobs:
-  extract:
+  compare:
     runs-on: ubuntu-latest
 
     steps:
@@ -14,425 +14,425 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler binwalk file xxd
+          sudo apt-get install -y \
+            device-tree-compiler \
+            python3 \
+            file \
+            binutils
 
-      - name: Download stock boot artifact
+      # --------------------------------------------------
+      # Download previously successful mainline kernel artifact
+      # --------------------------------------------------
+      - name: Download mainline dandelion DTB
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p input
+          mkdir -p mainline
 
-          gh run download 33605127291 \
-            -n Redmi9A-Stock-Boot-V12.5.9.0-RCDINXM \
-            -D input
+          gh run download 33749861009 \
+            -D mainline \
+            || true
 
-          BOOT=$(find input -type f -name "*.img" | head -n 1)
+          echo "=== DOWNLOADED FILES ==="
+          find mainline -type f -maxdepth 5 -print
 
-          if [ -z "$BOOT" ]; then
-            echo "ERROR: stock boot.img not found"
-            exit 1
-          fi
-
-          cp "$BOOT" stock-boot.img
-
-          echo "=== STOCK BOOT ==="
-          ls -lh stock-boot.img
-          file stock-boot.img
-
-      - name: Locate vendor DT container
+      # --------------------------------------------------
+      # Locate dandelion.dtb from artifact
+      # --------------------------------------------------
+      - name: Locate mainline DTB
         run: |
-          python3 <<'PY'
-          import struct
-
-          data = open("stock-boot.img", "rb").read()
-
-          magic = b"\xd7\xb7\xab\x1e"
-
-          offsets = []
-          pos = 0
-
-          while True:
-              pos = data.find(magic, pos)
-
-              if pos == -1:
-                  break
-
-              offsets.append(pos)
-              pos += 1
-
-          print("Vendor DT magic occurrences:")
-
-          for x in offsets:
-              print(f"0x{x:X} ({x})")
-
-          if not offsets:
-              raise SystemExit("ERROR: d7b7ab1e not found")
-
-          # Known stock Redmi 9A DT container.
-          container_start = offsets[0]
-          container_size = 133668
-
-          container_end = container_start + container_size
-
-          if container_end > len(data):
-              raise SystemExit("ERROR: DT container outside boot image")
-
-          container = data[container_start:container_end]
-
-          open("stock-dt-container.bin", "wb").write(container)
-
-          print()
-          print(f"Container start : 0x{container_start:X}")
-          print(f"Container end   : 0x{container_end:X}")
-          print(f"Container size  : {len(container)}")
-          PY
-
-      - name: Scan DT container for real FDT
-        run: |
-          python3 <<'PY'
-          import struct
-
-          data = open("stock-dt-container.bin", "rb").read()
-
-          magic = b"\xd0\x0d\xfe\xed"
-
-          positions = []
-          pos = 0
-
-          while True:
-              pos = data.find(magic, pos)
-
-              if pos == -1:
-                  break
-
-              positions.append(pos)
-              pos += 1
-
-          print("=== FDT SIGNATURES INSIDE DT CONTAINER ===")
-
-          for p in positions:
-              print(f"FDT candidate: container offset 0x{p:X}")
-
-          if not positions:
-              raise SystemExit(
-                  "ERROR: No d00dfeed found inside DT container"
-              )
-
-          with open("fdt-candidates.txt", "w") as report:
-              report.write(
-                  "FDT candidates inside Redmi 9A stock DT container\n"
-              )
-              report.write("=" * 70 + "\n\n")
-
-              for p in positions:
-
-                  report.write(f"Candidate offset: 0x{p:X}\n")
-
-                  if p + 40 > len(data):
-                      report.write("Not enough bytes for FDT header\n\n")
-                      continue
-
-                  vals = struct.unpack_from(
-                      ">10I",
-                      data,
-                      p
-                  )
-
-                  (
-                      magic_value,
-                      totalsize,
-                      off_dt_struct,
-                      off_dt_strings,
-                      off_mem_rsvmap,
-                      version,
-                      last_comp_version,
-                      boot_cpuid_phys,
-                      size_dt_strings,
-                      size_dt_struct
-                  ) = vals
-
-                  report.write(
-                      f"magic             : 0x{magic_value:08X}\n"
-                      f"totalsize         : {totalsize}\n"
-                      f"off_dt_struct     : 0x{off_dt_struct:X}\n"
-                      f"off_dt_strings    : 0x{off_dt_strings:X}\n"
-                      f"off_mem_rsvmap    : 0x{off_mem_rsvmap:X}\n"
-                      f"version           : {version}\n"
-                      f"last_comp_version : {last_comp_version}\n"
-                      f"boot_cpuid_phys   : {boot_cpuid_phys}\n"
-                      f"size_dt_strings   : {size_dt_strings}\n"
-                      f"size_dt_struct    : {size_dt_struct}\n"
-                  )
-
-                  valid = (
-                      totalsize >= 40 and
-                      p + totalsize <= len(data) and
-                      off_dt_struct < totalsize and
-                      off_dt_strings < totalsize and
-                      version >= 1 and
-                      version <= 20
-                  )
-
-                  report.write(f"VALID HEADER: {valid}\n\n")
-
-          print(open("fdt-candidates.txt").read())
-          PY
-
-      - name: Extract every valid FDT
-        run: |
-          mkdir -p extracted-fdts
-
-          python3 <<'PY'
-          import struct
-          import os
-
-          data = open("stock-dt-container.bin", "rb").read()
-
-          magic = b"\xd0\x0d\xfe\xed"
-
-          pos = 0
-          count = 0
-
-          while True:
-              pos = data.find(magic, pos)
-
-              if pos == -1:
-                  break
-
-              if pos + 40 <= len(data):
-
-                  (
-                      f_magic,
-                      totalsize,
-                      off_dt_struct,
-                      off_dt_strings,
-                      off_mem_rsvmap,
-                      version,
-                      last_comp_version,
-                      boot_cpuid_phys,
-                      size_dt_strings,
-                      size_dt_struct
-                  ) = struct.unpack_from(
-                      ">10I",
-                      data,
-                      pos
-                  )
-
-                  valid = (
-                      totalsize >= 40 and
-                      pos + totalsize <= len(data) and
-                      off_dt_struct < totalsize and
-                      off_dt_strings < totalsize and
-                      version >= 1 and
-                      version <= 20
-                  )
-
-                  if valid:
-
-                      count += 1
-
-                      name = (
-                          f"fdt_{count:02d}_"
-                          f"container_0x{pos:X}.dtb"
-                      )
-
-                      output = os.path.join(
-                          "extracted-fdts",
-                          name
-                      )
-
-                      with open(output, "wb") as f:
-                          f.write(
-                              data[pos:pos + totalsize]
-                          )
-
-                      print(
-                          f"Extracted {output} "
-                          f"size={totalsize}"
-                      )
-
-              pos += 1
-
-          if count == 0:
-              raise SystemExit(
-                  "ERROR: No valid FDT extracted"
-              )
-
-          print(f"Total valid FDTs: {count}")
-          PY
-
-      - name: Validate extracted DTBs
-        run: |
-          : > dtc-validation.txt
-
-          for dtb in extracted-fdts/*.dtb; do
-
-            echo "========================================" \
-              | tee -a dtc-validation.txt
-
-            echo "FILE: $dtb" \
-              | tee -a dtc-validation.txt
-
-            echo "========================================" \
-              | tee -a dtc-validation.txt
-
-            file "$dtb" \
-              | tee -a dtc-validation.txt
-
-            dtc \
-              -I dtb \
-              -O dts \
-              "$dtb" \
-              -o "${dtb%.dtb}.dts" \
-              2>&1 \
-              | tee -a dtc-validation.txt || true
-
-            echo \
-              | tee -a dtc-validation.txt
-
-          done
-
-      - name: Inspect first valid DTB
-        run: |
-          FIRST=$(find extracted-fdts \
+          DTB=$(find mainline \
             -type f \
-            -name "*.dtb" \
-            | sort \
+            \( -name "dandelion.dtb" \
+            -o -name "mt6762g-xiaomi-dandelion.dtb" \) \
             | head -n 1)
 
-          if [ -z "$FIRST" ]; then
-            echo "No extracted DTB"
+          if [ -z "$DTB" ]; then
+            echo "ERROR: mainline dandelion DTB not found"
             exit 1
           fi
 
-          cp "$FIRST" stock-dandelion.dtb
+          cp "$DTB" mainline-dandelion.dtb
 
-          echo "Selected:"
-          echo "$FIRST"
+          echo "Mainline DTB:"
+          file mainline-dandelion.dtb
+          ls -lh mainline-dandelion.dtb
 
-          ls -lh stock-dandelion.dtb
-
-      - name: Inspect DTB identity
+      # --------------------------------------------------
+      # Download stock DT extraction artifact
+      # --------------------------------------------------
+      - name: Download stock DT extraction
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          FIRST_DTS=$(find extracted-fdts \
+          mkdir -p stock
+
+          gh run download 33856392991 \
+            -D stock
+
+          echo "=== STOCK ARTIFACT ==="
+          find stock -type f -maxdepth 6 -print
+
+      # --------------------------------------------------
+      # Locate stock DTS
+      # --------------------------------------------------
+      - name: Locate stock DTS
+        run: |
+          STOCK_DTS=$(find stock \
             -type f \
-            -name "*.dts" \
-            | sort \
+            -name "stock-dandelion.dts" \
             | head -n 1)
 
-          if [ -z "$FIRST_DTS" ]; then
-            echo "No DTS generated"
+          if [ -z "$STOCK_DTS" ]; then
+            echo "ERROR: stock-dandelion.dts not found"
             exit 1
           fi
 
-          cp "$FIRST_DTS" stock-dandelion.dts
+          cp "$STOCK_DTS" stock-dandelion.dts
 
+          echo "Stock DTS:"
+          ls -lh stock-dandelion.dts
+
+      # --------------------------------------------------
+      # Decompile mainline DTB
+      # --------------------------------------------------
+      - name: Decompile mainline DTB
+        run: |
+          dtc \
+            -I dtb \
+            -O dts \
+            mainline-dandelion.dtb \
+            -o mainline-dandelion.dts \
+            2>&1 | tee mainline-dtc.log || true
+
+          if [ ! -s mainline-dandelion.dts ]; then
+            echo "ERROR: Failed to generate mainline DTS"
+            exit 1
+          fi
+
+          echo "=== MAINLINE DTS ==="
+          ls -lh mainline-dandelion.dts
+
+      # --------------------------------------------------
+      # Basic DT information
+      # --------------------------------------------------
+      - name: Generate DT overview
+        run: |
           {
-            echo "=== DEVICE IDENTITY ==="
+            echo "=========================================="
+            echo "REDMI 9A DEVICE TREE OVERVIEW"
+            echo "=========================================="
             echo
 
+            echo "=== STOCK DTB ==="
             grep -inE \
-              'model|compatible|xiaomi|dandelion|mt6762|mt6765' \
-              stock-dandelion.dts \
-              | head -200 || true
-
-            echo
-            echo "=== CPU ==="
-
-            grep -inE \
-              'cpu@|cpus' \
+              'model =|compatible =|bootargs|#address-cells|#size-cells' \
               stock-dandelion.dts \
               | head -100 || true
 
             echo
-            echo "=== MEMORY ==="
-
+            echo "=== MAINLINE DTS ==="
             grep -inE \
-              'memory@|device_type.*memory|reg =' \
-              stock-dandelion.dts \
-              | head -150 || true
+              'model =|compatible =|bootargs|#address-cells|#size-cells' \
+              mainline-dandelion.dts \
+              | head -100 || true
 
-          } > stock-dtb-identity.txt
+          } | tee dt-overview.txt
 
-          cat stock-dtb-identity.txt
-
-      - name: Dump DT container header bytes
+      # --------------------------------------------------
+      # Extract node names
+      # --------------------------------------------------
+      - name: Extract node lists
         run: |
-          xxd -g 1 -l 128 stock-dt-container.bin \
-            > dt-container-header-hex.txt
+          python3 <<'PY'
+          import re
 
-          cat dt-container-header-hex.txt
+          def extract_nodes(path):
+              text = open(path, errors="ignore").read()
 
-      - name: Search strings in stock DTB
+              nodes = set()
+
+              for line in text.splitlines():
+                  line = line.strip()
+
+                  if not line or line.startswith("//"):
+                      continue
+
+                  # Remove labels before node declaration
+                  line = re.sub(r'^[A-Za-z0-9_]+:\s*', '', line)
+
+                  m = re.match(r'([A-Za-z0-9,._+\-]+(?:@[0-9a-fA-Fx]+)?)\s*\{', line)
+
+                  if m:
+                      nodes.add(m.group(1))
+
+              return sorted(nodes)
+
+          stock = extract_nodes("stock-dandelion.dts")
+          mainline = extract_nodes("mainline-dandelion.dts")
+
+          open("stock-nodes.txt", "w").write(
+              "\n".join(stock) + "\n"
+          )
+
+          open("mainline-nodes.txt", "w").write(
+              "\n".join(mainline) + "\n"
+          )
+
+          print("Stock nodes:", len(stock))
+          print("Mainline nodes:", len(mainline))
+          PY
+
+      # --------------------------------------------------
+      # Compare node names
+      # --------------------------------------------------
+      - name: Compare node names
         run: |
-          strings -a stock-dandelion.dtb \
-            > stock-dtb-strings.txt
+          comm -23 \
+            <(sort stock-nodes.txt) \
+            <(sort mainline-nodes.txt) \
+            > stock-only-nodes.txt || true
 
-          grep -inE \
-            'dandelion|xiaomi|mt6762|mt6765|mediatek|boot|memory|chosen' \
-            stock-dtb-strings.txt \
-            | head -300 \
-            > stock-dtb-relevant-strings.txt || true
+          comm -13 \
+            <(sort stock-nodes.txt) \
+            <(sort mainline-nodes.txt) \
+            > mainline-only-nodes.txt || true
 
-          cat stock-dtb-relevant-strings.txt
+          echo "=== STOCK ONLY NODES ==="
+          cat stock-only-nodes.txt
 
-      - name: SHA256
+          echo
+          echo "=== MAINLINE ONLY NODES ==="
+          cat mainline-only-nodes.txt
+
+      # --------------------------------------------------
+      # Search important hardware
+      # --------------------------------------------------
+      - name: Compare important hardware
         run: |
-          sha256sum \
-            stock-boot.img \
-            stock-dt-container.bin \
-            stock-dandelion.dtb \
-            > SHA256SUMS.txt
+          {
+            echo "=========================================="
+            echo "IMPORTANT HARDWARE COMPARISON"
+            echo "=========================================="
+            echo
 
-          cat SHA256SUMS.txt
+            for pattern in \
+              'uart' \
+              'serial' \
+              'mmc' \
+              'msdc' \
+              'ufs' \
+              'pinctrl' \
+              'gpio' \
+              'i2c' \
+              'spi' \
+              'usb' \
+              'xhci' \
+              'display' \
+              'dsi' \
+              'drm' \
+              'panel' \
+              'backlight' \
+              'touch' \
+              'tpd' \
+              'battery' \
+              'charger' \
+              'pmic' \
+              'mt6357' \
+              'regulator' \
+              'clk' \
+              'clock' \
+              'watchdog' \
+              'wdt' \
+              'thermal' \
+              'mali' \
+              'gpu' \
+              'wifi' \
+              'wlan' \
+              'bluetooth' \
+              'bt' \
+              'camera' \
+              'sensor' \
+              'reserved-memory' \
+              'memory@' \
+              'chosen'
+            do
 
-      - name: Create final package
+              echo
+              echo "########################################"
+              echo "PATTERN: $pattern"
+              echo "########################################"
+
+              echo "--- STOCK ---"
+              grep -inE "$pattern" \
+                stock-dandelion.dts \
+                | head -80 || true
+
+              echo "--- MAINLINE ---"
+              grep -inE "$pattern" \
+                mainline-dandelion.dts \
+                | head -80 || true
+
+            done
+
+          } | tee important-hardware.txt
+
+      # --------------------------------------------------
+      # Compare compatible strings
+      # --------------------------------------------------
+      - name: Compare compatible strings
         run: |
-          mkdir -p Redmi9A-Stock-DT-Extracted
+          grep -oE \
+            'compatible = "[^"]+"' \
+            stock-dandelion.dts \
+            | sort -u \
+            > stock-compatible.txt
 
-          cp stock-boot.img \
-            Redmi9A-Stock-DT-Extracted/
+          grep -oE \
+            'compatible = "[^"]+"' \
+            mainline-dandelion.dts \
+            | sort -u \
+            > mainline-compatible.txt
 
-          cp stock-dt-container.bin \
-            Redmi9A-Stock-DT-Extracted/
+          comm -23 \
+            <(sort stock-compatible.txt) \
+            <(sort mainline-compatible.txt) \
+            > stock-only-compatible.txt || true
 
-          cp stock-dandelion.dtb \
-            Redmi9A-Stock-DT-Extracted/
+          comm -13 \
+            <(sort stock-compatible.txt) \
+            <(sort mainline-compatible.txt) \
+            > mainline-only-compatible.txt || true
+
+          echo "=== STOCK ONLY COMPATIBLES ==="
+          cat stock-only-compatible.txt
+
+          echo
+          echo "=== MAINLINE ONLY COMPATIBLES ==="
+          cat mainline-only-compatible.txt
+
+      # --------------------------------------------------
+      # Compare node properties for important areas
+      # --------------------------------------------------
+      - name: Generate focused DT report
+        run: |
+          {
+            echo "=========================================="
+            echo "REDMI 9A DT DEEP ANALYSIS"
+            echo "=========================================="
+            echo
+
+            echo "=== STOCK FILE ==="
+            wc -l stock-dandelion.dts
+            wc -c stock-dandelion.dts
+
+            echo
+            echo "=== MAINLINE FILE ==="
+            wc -l mainline-dandelion.dts
+            wc -c mainline-dandelion.dts
+
+            echo
+            echo "=== STOCK NODE COUNT ==="
+            wc -l stock-nodes.txt
+
+            echo
+            echo "=== MAINLINE NODE COUNT ==="
+            wc -l mainline-nodes.txt
+
+            echo
+            echo "=== STOCK-ONLY NODE COUNT ==="
+            wc -l stock-only-nodes.txt
+
+            echo
+            echo "=== MAINLINE-ONLY NODE COUNT ==="
+            wc -l mainline-only-nodes.txt
+
+            echo
+            echo "=== STOCK-ONLY COMPATIBLE COUNT ==="
+            wc -l stock-only-compatible.txt
+
+            echo
+            echo "=== MAINLINE-ONLY COMPATIBLE COUNT ==="
+            wc -l mainline-only-compatible.txt
+
+          } | tee dt-summary.txt
+
+      # --------------------------------------------------
+      # Create unified textual diff
+      # --------------------------------------------------
+      - name: Create DTS diff
+        run: |
+          diff -u \
+            stock-dandelion.dts \
+            mainline-dandelion.dts \
+            > stock-vs-mainline.diff \
+            || true
+
+          echo "Diff generated:"
+          ls -lh stock-vs-mainline.diff
+
+      # --------------------------------------------------
+      # Package analysis
+      # --------------------------------------------------
+      - name: Create comparison package
+        run: |
+          mkdir -p Redmi9A-DT-Comparison
 
           cp stock-dandelion.dts \
-            Redmi9A-Stock-DT-Extracted/
+            Redmi9A-DT-Comparison/
 
-          cp fdt-candidates.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp mainline-dandelion.dtb \
+            Redmi9A-DT-Comparison/
 
-          cp dtc-validation.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp mainline-dandelion.dts \
+            Redmi9A-DT-Comparison/
 
-          cp stock-dtb-identity.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp mainline-dtc.log \
+            Redmi9A-DT-Comparison/
 
-          cp stock-dtb-strings.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp dt-overview.txt \
+            Redmi9A-DT-Comparison/
 
-          cp stock-dtb-relevant-strings.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp stock-nodes.txt \
+            Redmi9A-DT-Comparison/
 
-          cp dt-container-header-hex.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp mainline-nodes.txt \
+            Redmi9A-DT-Comparison/
 
-          cp SHA256SUMS.txt \
-            Redmi9A-Stock-DT-Extracted/
+          cp stock-only-nodes.txt \
+            Redmi9A-DT-Comparison/
 
-          cp -r extracted-fdts \
-            Redmi9A-Stock-DT-Extracted/
+          cp mainline-only-nodes.txt \
+            Redmi9A-DT-Comparison/
+
+          cp important-hardware.txt \
+            Redmi9A-DT-Comparison/
+
+          cp stock-compatible.txt \
+            Redmi9A-DT-Comparison/
+
+          cp mainline-compatible.txt \
+            Redmi9A-DT-Comparison/
+
+          cp stock-only-compatible.txt \
+            Redmi9A-DT-Comparison/
+
+          cp mainline-only-compatible.txt \
+            Redmi9A-DT-Comparison/
+
+          cp dt-summary.txt \
+            Redmi9A-DT-Comparison/
+
+          cp stock-vs-mainline.diff \
+            Redmi9A-DT-Comparison/
 
           zip -r \
-            Redmi9A-Stock-DT-Extracted.zip \
-            Redmi9A-Stock-DT-Extracted
+            Redmi9A-DT-Comparison.zip \
+            Redmi9A-DT-Comparison
 
-      - name: Upload result
+      - name: Upload comparison report
         uses: actions/upload-artifact@v4
         with:
-          name: Redmi9A-Stock-DT-Extracted
-          path: Redmi9A-Stock-DT-Extracted.zip
+          name: Redmi9A-DT-Comparison
+          path: Redmi9A-DT-Comparison.zip
           retention-days: 14
